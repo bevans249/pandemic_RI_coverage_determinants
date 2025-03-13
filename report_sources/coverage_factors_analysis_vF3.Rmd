@@ -1,0 +1,3371 @@
+---
+title: "Factors related to routine immunisation coverage during the COVID-19 pandemic: data exploration"
+author: "Beth Evans"
+date: "03 Mar 2025"
+output: html_document
+---
+
+# Set-up
+```{r setup, include=FALSE}
+# For chunks
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Load packages
+```{r, message = FALSE}
+library(epiDisplay)
+library(tidyverse)
+library(rio)
+library(magrittr)
+library(broom)
+library(lubridate)
+library(scales)
+library(countrycode)
+library(here)
+library(stringr)
+library(flextable)
+library(wesanderson)
+library(corrr)
+library(corrplot)
+library(ggcorrplot)
+library(factoextra)
+library(cowplot)
+library(httr)
+library(jsonlite)
+library(flextable)
+library(randomForest)
+library(caret)
+library(caTools)
+library(reshape2)
+library(iml)
+library(rpart)
+library(rpart.plot)
+library(car)
+library(spData)
+library(rnaturalearth)
+library(officer)
+
+select <- dplyr::select
+```
+
+# Save shortcuts for output figures
+- These shortcuts allow easily streamlining of figures throughout the analysis 
+```{r}
+scale_y <- scale_y_continuous(labels = percent_format())
+scale_y_lim <- scale_y_continuous(labels = percent_format(), limits = c(-0.3,+0.2))
+
+theme <- theme(legend.position = c(0.8,0.2), 
+        legend.direction = "vertical",
+        legend.box = "vertical",
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))
+
+hline <- geom_hline(yintercept = 0, linetype = "dashed", colour = "black")
+
+colour <- scale_colour_manual(values = wes_palette("Darjeeling1", n = 3),
+                              labels = c("2020",
+                                         "2021",
+                                         "2022"),
+                              name = "Year")
+```
+
+# Define functions for use later on
+- Optimising threshold function: this function identifies the turning point of a set of data for use in the linear regression analyses. 
+- x = predictor
+- y = response variable
+- n_values = number of threshold values to try
+- quantile = determines the windows of tried values starts and stops, by default we use 80% of central values, leaving 10% of smallest and largest values
+```{r}
+find_threshold <- function(x, y, n_values = 100, quantile = 0.1) {
+  ## define all thresholds
+  min_x <- quantile(x, quantile)
+  max_x <- quantile(x, 1 - quantile)
+  all_thresholds <- seq(min_x, max_x, length.out = n_values)
+  
+  ## get all corresponding R2
+  all_R2 <- sapply(
+    all_thresholds, # for each of these values, do the following
+    function(thres) # 'thres' is a placeholder for each threshold value
+      summary(lm(y ~ x * (x < thres)))$"adj.r.squared"
+  )
+
+  ## return the best one, and the corresponding model, as a list
+  best_threshold <- all_thresholds[which.max(all_R2)]
+  best_model <- lm(y ~ x * (x < best_threshold))
+  list(
+    R2 = all_R2,
+    all_thresholds = all_thresholds,
+    threshold = best_threshold, 
+    model = best_model
+    )
+}
+
+## wrapper for plotting
+custom_plot <- function(x, y, model) {
+  plot(x, y, pch = 20, cex = 1.5, col = 2)
+  lines(sort(x), predict(model, newdata = data.frame(x = sort(x))), 
+      col = 4, lwd = 2, lty = 2)
+}
+
+```
+
+# Import, clean, and explore data
+Here we import multiple global datasets and clean to select only country labelling and the relevant index or indices per dataset. Brief descriptions are given on each index.
+
+## Dependent variable: DTP3 vaccine coverage deltas
+- Our output variables of interest are changes in immunisation coverage during the pandemic compared to pre-pandemic trends, referred to as 'coverage deltas'. We focus on DTP3 as the core indicator of immunisation performance during the pandemic, noting that trends were aligned for DTP1 (indicator of Zero Dose), and MCV1 (delivered on a later schedule)
+- Source: These coverage deltas are calculated using methodology as detailed in our previous publication (Evans et al., 2023). The input datasets and code are all publicly available and also included on our GitHub repository.  We note that the coverage deltas have been recalculated based on the latest available WUENIC dataset, which includes retrospective updates to previously published datapoints. 
+- We initiate a tracker file to store all the indices being cleaned and calculated
+```{r}
+# Import data
+file_path_coverage <- here::here("data", "coverage_analysis_data_dtp3.csv")
+
+delta_data <- file_path_coverage %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+delta_data
+
+# Clean data
+delta <- delta_data %>%
+  select(iso_code, year, delta) %>%
+  mutate(year = as.character(year), 
+         delta = as.numeric(delta))
+
+delta_wide <- delta %>%
+  pivot_wider(names_from = year, values_from = delta, names_prefix = "delta_") %>%
+  mutate(delta_total = delta_2020 + delta_2021 + delta_2022)
+delta_wide
+
+# Initiate trackers - one in wide format; one in long format (for ease of different analyses)
+tracker <- delta_wide 
+explore <- delta_wide
+
+tracker_combo <- delta_wide %>%
+  select(-delta_total) %>%
+  pivot_longer(cols = !iso_code, names_to = "year", names_prefix = "delta_", values_to = "delta")
+
+# Plot coverage deltas visually
+  # Download country map data
+    countries <- ne_countries(returnclass = "sf")
+
+  # Format data for plotting  
+    delta_data <- tracker %>%
+      select(iso_a3 = iso_code, delta = delta_total) %>%
+      mutate(delta = 100 * delta)
+    
+    countries_delta <- countries %>%
+      left_join(delta_data, by = c("iso_a3"))
+
+  # Define colour palette
+    pal <- wes_palette("Zissou1", 100, type = "continuous")
+
+  # Plot geospatial map
+    coverage_map <- ggplot(data = countries_delta) +
+      geom_sf(aes(fill = delta), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE)) + 
+      labs(fill = "Total DTP3 delta \n(%, 2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+        legend.position = c(0.15, 0.35))
+
+    coverage_map
+    
+  # Save plot
+    ggsave(coverage_map, 
+       filename = "../figures/coverage_map.png",
+       height = 12, width = 30, units = "cm")
+
+
+```
+
+## Additional dataset: Population
+- Some factors are more comparable across countries when quantified relevant to population size, e.g., number of vaccinations, so we import the latest United Nations World Population Prospects population estimates and clean for data for 2020, 2021, and 2022
+```{r}
+# Import data 
+file_path_unwpp_raw <- here::here("data", "WPP2024_GEN_F01_DEMOGRAPHIC_INDICATORS_COMPACT.csv")
+
+unwpp_raw <- file_path_unwpp_raw %>%
+  rio::import(header = TRUE, skip = 17) %>%
+  tibble()
+
+unwpp_raw
+
+# Clean data
+unwpp <- unwpp_raw %>% 
+  filter(Type == "Country/Area") %>%
+  select(country = "Region, subregion, country or area *",
+         iso_code = "ISO3 Alpha-code",
+         population = "Total Population, as of 1 July (thousands)",
+         surviving_infants = "Live Births Surviving to Age 1 (thousands)",
+         year = "Year") %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(year >= 2019,
+         year <= 2022) %>%
+  mutate(surviving_infants = as.numeric(gsub(",", "", surviving_infants)) * 1000,
+         population = as.numeric(gsub(" ", "", population)) * 1000) 
+
+## Create wide dataset for total population only
+unwpp_wide_pop <- unwpp %>%
+  select(-c(country, surviving_infants)) %>%
+  pivot_wider(names_from = "year", names_prefix = "total_pop_", values_from = "population")
+unwpp_wide_pop
+```
+## Additional dataset: Income group
+```{r}
+# Import World Bank classification data
+file_path_wb <- here::here("data", "wb_ig_2023.csv")
+income_grp <- file_path_wb %>%
+  rio::import(header = TRUE, skip = 5) %>%
+  tibble()
+income_grp <- income_grp[-c(1:5), ]
+income_grp
+
+# Clean data - take mid pandemic classification (2021)
+income %<>% 
+  select(V1, `2021`) %>%
+  rename(iso_code = V1, `income_group` = `2021`) %>%
+  mutate(
+    income_group = recode_factor(income_group,
+                               "L" = "LIC",
+                               "LM" = "LMIC",
+                               "UM" = "UMIC",
+                               "H" = "HIC"))
+
+```
+## Independent variables
+
+### (1) Pre-pandemic immunisation performance
+- Source: WHO and UNICEF Estimates of National Immunisation Coverage (WUENIC) 2023 release
+- Description: DTP3 is a core indicator of immunisation system performance. It represents the third dose of DTP vaccine delivered, typically at 14 weeks old.
+- Data cleaning done done:
+   + We use WUENIC DTP3 coverage average for 2015-2019 inclusive as an indicator of pre-pandemic immunisation system performance
+   + Plot relationship between variable and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative- Only look at pre-pandemic DTP3 coverage (since pandemic DTP3 coverage is the dependent variable of interest)
+
+#### Data cleaning
+```{r}
+# Import data
+file_path_RI <- here::here("data", "dtp3_2023_release.csv")
+
+ri_data <- file_path_RI %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+ri_data
+
+# Clean data
+ri <- ri_data %>%
+  select(iso_code = iso3,
+         `2015`, `2016`, `2017`, `2018`, `2019`) %>%
+  rowwise() %>%
+  mutate(average_cov = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  select(iso_code, average_cov) 
+
+# Add data to tracker
+tracker %<>%
+  left_join(ri, by = "iso_code")
+
+# Long dataset
+ri_combo_dat <- tracker %>%
+  select(iso_code, average_cov, delta_2020, delta_2021, delta_2022) %>%
+  pivot_longer(!(iso_code:average_cov), values_to = "delta", names_to = "year", names_prefix = "delta_")
+
+tracker_combo %<>%
+  left_join(ri_combo_dat, by = c("iso_code", "year", "delta"))
+
+```
+
+#### Final figures
+```{r}
+# Per year
+ri_per_year <- ggplot(data = tracker)+
+  geom_point(aes(x = average_cov/100, y = delta_2020, colour = "2020")) +
+  geom_smooth(aes(x = average_cov/100,y = delta_2020, colour = "2020")) +
+  geom_point(aes(x = average_cov/100, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = average_cov/100,y = delta_2021, colour = "2021")) +
+  geom_point(aes(x = average_cov/100, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = average_cov/100,y = delta_2022, colour = "2022")) +
+  scale_x_continuous(labels = percent_format())+
+  labs(y = "DTP3 coverage delta", x = "Pre-pandemic DTP3 coverage \n(mean 2015-2019)")+
+  colour+
+  scale_y_lim+
+  theme(legend.position = c(0.2,0.25), 
+        legend.direction = "vertical",
+        legend.box = "vertical",
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+
+  hline
+
+# Combined
+ri_combo <- ggplot(data = tracker_combo)+
+  geom_point(aes(x = average_cov/100, y = delta, colour = year))+
+  geom_smooth(aes(x = average_cov/100, y = delta), colour = "darkgrey")+
+  scale_x_continuous(labels = percent_format())+
+  labs(y = "DTP3 coverage delta", x = "Pre-pandemic DTP3 coverage \n(mean 2015-2019)")+
+  colour+
+  scale_y_lim+
+  theme(legend.position = c(0.2,0.25), 
+        legend.direction = "vertical",
+        legend.box = "vertical",
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+
+  hline
+
+# Total
+ri_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(y = delta_total, x = average_cov/100))+
+  geom_smooth(aes(y = delta_total, x = average_cov/100), colour = "darkgrey") +
+  labs(y = "DTP3 coverage delta \n(cumulative 2020-2022)", x = "Pre-pandemic DTP3 coverage \n(mean 2015-2019)")+
+  scale_x_continuous(labels = percent_format())+
+  scale_y+
+  theme+
+  hline
+
+ri_plots <- plot_grid(ri_per_year, ri_combo, ri_total,
+                              ncol = 3, labels = c("1A", "1B", "1C"), label_size = 10)
+ri_plots
+
+# Save output
+ggsave(ri_plots, 
+       filename = "../figures/ri_plots_final.png",
+       height = 10, width = 30, units = "cm")
+
+``` 
+
+#### Univariate model
+```{r}
+lm_ri <- lm(data = tracker_combo, formula = delta ~ average_cov)
+summary(lm_ri)
+```
+
+### (2) Health workforce
+- Source: World Health Organisation Global Health Observatory - The National Health Workforce Accounts database - data on number of doctors and nurses per 10,000 population per country
+- Description: We consolidate (including summing together) and doctor and nurses quantification datasets
+- Data cleaning done: 
+  + We calculate the total of the doctors and nurses indicators
+  + Compare doctors vs. nurses vs. total trends during the pandemic
+  + Explore data for each year of pandemic
+  + Simplify data to representative summary dataset
+  + Plot relationship between variable and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative
+
+#### Data cleaning
+```{r}
+# Import data
+file_path_doctors <- here::here("data", "doctors.csv")
+file_path_nurses <- here::here("data", "nurses.csv")
+
+doctors_data <- file_path_doctors %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+doctors_data
+
+nurses_data <- file_path_nurses %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+nurses_data
+
+# Filter and select data
+doctors <- doctors_data %>%
+  select(iso_code = SpatialDimValueCode, year = Period, value = Value) %>%
+  filter(year >= 2015 & year <= 2019) %>%
+  pivot_wider(names_from = year, values_from = value) %>%
+  rowwise() %>%
+  mutate(mean_doctors = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  select(iso_code, mean_doctors) %>%
+  as_tibble() 
+
+nurses <- nurses_data %>%
+  select(iso_code = SpatialDimValueCode, year = Period, value = Value) %>%
+  filter(year >= 2015 & year <= 2019) %>%
+  pivot_wider(names_from = year, values_from = value) %>%
+  rowwise() %>%
+  mutate(mean_nurses = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  select(iso_code, mean_nurses) %>%
+  as_tibble() 
+
+hcw <- doctors %>%
+  left_join(nurses, by = "iso_code") %>%
+  na.omit() %>%
+  mutate(healthworkforce = mean_doctors + mean_nurses) 
+
+# Add to exploratory dataset
+explore %<>% left_join(hcw, by  = "iso_code")
+```
+
+#### Explore relationship
+```{r}
+# Compare trends for doctors and nurses to see if can just consider combined indicator
+hcw_compare <- ggplot(data = explore)+
+  geom_point(aes(x = mean_doctors, y = delta_total, colour = "doctors"))+
+  geom_smooth(aes(x = mean_doctors, y = delta_total, colour = "doctors")) +
+  geom_point(aes(x = mean_nurses, y = delta_total, colour = "nurses"))+
+  geom_smooth(aes(x = mean_nurses, y = delta_total, colour = "nurses")) +
+  geom_point(aes(x = healthworkforce, y = delta_total, colour = "total"))+
+  geom_smooth(aes(x = healthworkforce, y = delta_total, colour = "total")) +
+  labs(x = "Health workers per 10,000 population \n(2015-2019 average, where data available)", y = "DTP3 coverage delta \n(cumulative 2020-2022)")+
+  scale_colour_manual(values = wes_palette("BottleRocket2"),
+                      labels = c("Doctors", "Nurses", "Total"),
+                      name = "Dataset")+
+  scale_y_lim+
+  theme+
+  hline
+
+# Compare trends per year to see if suitable to look at total / cumulative trends
+healthworkforce_annual <- ggplot(data = explore)+
+  geom_point(aes(x = healthworkforce, y = delta_2020, colour = "2020")) +
+  geom_smooth(aes(x = healthworkforce, y = delta_2020, colour = "2020"))+
+  geom_point(aes(x = healthworkforce, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = healthworkforce, y = delta_2021, colour = "2021"))+
+  geom_point(aes(x = healthworkforce, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = healthworkforce, y = delta_2022, colour = "2022"))+
+  labs(x = "Mean healthworkforce (doctors and nurses) per 10,000 \npopulation (2015-2019 where data available)", y = "DTP3 coverage delta")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+healthworkforce_explore <- plot_grid(hcw_compare, healthworkforce_annual, ncol = 2)
+healthworkforce_explore
+```
+
+*Results:*
+- Similar trends for doctors and nurses --> simplify to only look at total healthworkforce per 10,000 population
+- Similar trends between independent variable for each year of the pandemic --> can summarise as single line of best fit across all years
+- We see a different relationship after healthworkforce score > 50 therefore create an indicator for this
+
+#### Simplify data
+```{r}
+hcw %<>%
+  select(iso_code, healthworkforce)
+
+# Add to tracker
+tracker %<>%
+  left_join(hcw, by = "iso_code")
+
+# Long dataset
+healthworkforce_combo_dat <- tracker %>%
+  select(iso_code, healthworkforce, delta_2020, delta_2021, delta_2022) %>%
+  pivot_longer(cols = !c(iso_code:healthworkforce), names_prefix = "delta_", names_to = "year", values_to = "delta")
+
+tracker_combo %<>% 
+  left_join(healthworkforce_combo_dat, by = c("iso_code", "year", "delta"))
+
+```
+
+#### Final figures
+```{r}
+# Per year
+healthworkforce_per_year <- ggplot(data = tracker)+
+  geom_point(aes(x = healthworkforce, y = delta_2020, colour = "2020")) +
+  geom_smooth(aes(x = healthworkforce, y = delta_2020, colour = "2020"))+
+  geom_point(aes(x = healthworkforce, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = healthworkforce, y = delta_2021, colour = "2021"))+
+  geom_point(aes(x = healthworkforce, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = healthworkforce, y = delta_2022, colour = "2022"))+
+  labs(x = "Number of doctors and nurses per 10,000\npopulation (mean 2015-2019)", y = "DTP3 coverage delta")+
+  colour+
+  scale_y_lim+
+  theme(legend.position = c(0.8,0.25), 
+        legend.direction = "vertical",
+        legend.box = "vertical",
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+  
+  hline
+
+# Combined
+healthworkforce_combo <- ggplot(data = tracker_combo)+
+  geom_point(aes(x = healthworkforce, y = delta, colour = year))+
+  geom_smooth(aes(x = healthworkforce, y = delta), colour = "darkgrey")+
+  labs(x = "Number of doctors and nurses per 10,000\npopulation (mean 2015-2019)", y = "DTP3 coverage delta")+
+  colour+
+  scale_y_lim+
+  theme(legend.position = c(0.8,0.25), 
+        legend.direction = "vertical",
+        legend.box = "vertical",
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+  
+  hline
+
+# Total
+healthworkforce_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(y = delta_total, x = healthworkforce))+
+  geom_smooth(aes(y = delta_total, x = healthworkforce), colour = "darkgrey") +
+  labs(x = "Number of doctors and nurses per 10,000\npopulation (mean 2015-2019)", y = "DTP3 coverage delta \n(cumulative 2020-2022")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+healthworkforce_final_plots <- plot_grid(healthworkforce_per_year, healthworkforce_combo, healthworkforce_total,
+                                         ncol = 3, labels = c("2A", "2B", "2C"),
+                                         label_size = 10)
+healthworkforce_final_plots
+
+# Save output
+ggsave(healthworkforce_final_plots, 
+       filename = "../figures/healthworkforce_final.png",
+       height = 10, width = 30, units = "cm")
+
+# Create and save output that combines RI and healthworkforce for final paper
+uni_plots <- plot_grid(ri_plots, healthworkforce_final_plots,
+                       ncol = 1, nrow = 2,
+                       label_size = 12)
+
+uni_plots
+ggsave(uni_plots, 
+       filename = "../figures/uni_plots.png",
+       height = 14, width = 21, units = "cm")
+
+```
+
+#### Univariate model
+```{r}
+lm_hwf <- lm(data = tracker_combo, formula = delta ~ healthworkforce)
+summary(lm_hwf)
+
+```
+
+### (3) Health systems strength: using Universal Health Coverage (UHC) Index
+- Source: World Health Organisation UHC service coverage index (Sustainable Development Goal 3.8.1)
+- Description: Single index designed to summarize existing indicators of health service coverage to ensure consistency with Sustainable Development Goal monitoring.
+- Data cleaning completed:
+  + Explore index for pre- vs. during pandemic
+  + Explore data for each year of pandemic
+  + Simplify data to representative summary dataset
+  + Plot relationship between index and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative
+  
+#### Data cleaning
+```{r}
+file_path_uhc <- here::here("data", "uhc_data.csv")
+
+uhc_data <- file_path_uhc %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+uhc_data
+
+# Clean data
+uhc <- uhc_data %>%
+  filter(Period >= 2015 & Period <= 2022) %>%
+  select(iso_code = SpatialDimValueCode, uhc_index = FactValueNumeric, year = Period) %>%
+  pivot_wider(values_from = uhc_index, names_from = year, names_prefix = "uhc_index_") %>%
+  mutate(uhc_mean_pp = round(rowMeans(select(.,uhc_index_2015, uhc_index_2017, uhc_index_2019), na.rm = TRUE), digits = 1),
+         uhc_delta = uhc_index_2021 - uhc_mean_pp,
+         uhc_perc_change = uhc_delta/uhc_mean_pp)
+
+# Add data to exploration dataset
+explore %<>%
+  left_join(uhc, by = "iso_code") 
+explore
+```
+
+#### Explore relationship
+```{r}
+# Compare during vs. pre-pandemic trends - are there major differences or is it sufficient to look at pre-pandemic trends (to minimise risk of pandemic influence on data from during the pandemic?)
+uhc_scatter <- ggplot(data = explore)+
+  geom_point(aes(x = uhc_index_2021, y = delta_total, colour = "during")) + 
+  geom_smooth(aes(x = uhc_index_2021, y = delta_total, colour = "during"))+
+  geom_point(aes(x = uhc_mean_pp, y = delta_total, colour = "pre")) +
+  geom_smooth(aes(x = uhc_mean_pp, y = delta_total, colour = "pre"))+
+  labs(y = "DTP3 coverage delta \n(cumulative 2020-2022)", x = "UHC index")+
+  scale_colour_manual(values = wes_palette("BottleRocket2"),
+                      labels = c("Pre-pandemic (2015-2019)", "During pandemic (2021)"),
+                      name = "")+
+  scale_y_lim+
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 7),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+
+  hline
+
+# Compare trends across each year of data - are trends similar to allow fitting single line of best fit across all data combined? 
+uhc_annual <- ggplot(data = explore)+
+  geom_point(aes(x = uhc_mean_pp, y = delta_2020, colour = "2020")) +
+  geom_smooth(aes(x = uhc_mean_pp, y = delta_2020, colour = "2020"))+
+  geom_point(aes(x = uhc_mean_pp, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = uhc_mean_pp, y = delta_2021, colour = "2021"))+
+  geom_point(aes(x = uhc_mean_pp, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = uhc_mean_pp, y = delta_2022, colour = "2022"))+
+  labs(y = "DTP3 coverage delta", x = "UHC index (pre-pandemic: 2015-2019)")+
+  scale_colour_manual(values = wes_palette("Darjeeling1"),
+                      labels = c("2020", "2021", "2022"),
+                      name = "")+
+  scale_y_lim+
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 7),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+
+  hline
+
+uhc_explore <- plot_grid(uhc_scatter, uhc_annual, ncol = 2)
+uhc_explore
+```
+
+*Results:*
+- Similar trends for pre- and during- pandemic --> simplify to only look at pre-pandemic data for independent variable
+- Similar trends between independent variable for each year of the pandemic --> can summarise as single line of best fit across all years
+- Also, appears the relationship is different (roughly flat) where UHC index < 70, and that there is a linear relationship with increasing coverage as UHC index increases > 70. Therefore, create binary flag to enable analysis including this
+
+#### Simplify data 
+```{r}
+# Simplify to a single UHC index - taking pre-pandemic average to be conservative
+uhc %<>%
+  select(iso_code, uhc_mean_pp) %>%
+  rename(uhc_mean_index = uhc_mean_pp) 
+
+# Add to tracker
+tracker %<>%
+  left_join(uhc, by = "iso_code")
+
+# Long dataset
+uhc_combo_dat <- tracker %>%
+  select(iso_code, uhc_mean_index, delta_2020, delta_2021, delta_2022) %>%
+  pivot_longer(!(iso_code:uhc_mean_index), values_to = "delta", names_to = "year", names_prefix = "delta_")
+
+tracker_combo %<>%
+  left_join(uhc_combo_dat, by = c("iso_code", "year", "delta"))
+
+```
+
+#### Final figures
+```{r}
+# Per year
+uhc_scatter_per_year <- ggplot(data = tracker)+
+  geom_point(aes(x = uhc_mean_index, y = delta_2020, colour = "2020"))+
+  geom_smooth(aes(x = uhc_mean_index, y = delta_2020, colour = "2020")) +
+  geom_point(aes(x = uhc_mean_index, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = uhc_mean_index, y = delta_2021, colour = "2021")) +
+  geom_point(aes(x = uhc_mean_index, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = uhc_mean_index, y = delta_2022, colour = "2022")) +
+  labs(y = "DTP3 coverage delta", x = "UHC index (mean 2015-2019)")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+# Combined
+uhc_combo <- ggplot(data = tracker_combo)+
+  geom_point(aes(x = uhc_mean_index, y = delta, colour = year))+
+  geom_smooth(aes(x = uhc_mean_index, y = delta), colour = "darkgrey")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline+  
+  labs(y = "DTP3 coverage delta", x = "UHC index (mean 2015-2019)")
+
+# Total
+uhc_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(x = uhc_mean_index, y = delta_total, ))+
+  geom_smooth(aes(x = uhc_mean_index, y = delta_total), colour = "darkgrey") +
+  labs(y = "DTP3 coverage delta (cumulative, 2020-2022)", x = "UHC index (mean 2015-2019)")+
+  scale_y+
+  theme+
+  hline
+
+# Output
+uhc_plots_final <- plot_grid(uhc_scatter_per_year, uhc_combo, uhc_total,
+                              labels = c("A", "B", "C"), 
+                              align= "h", ncol = 3, rel_widths = c(1,1,1), label_size = 10)
+uhc_plots_final
+
+# Save output
+ggsave(uhc_plots_final, 
+       filename = "../figures/hss_final.png",
+       height = 10, width = 30, units = "cm")
+```
+
+
+#### Univariate model
+```{r}
+lm_uhc <- lm(data = tracker_combo, formula = delta ~ uhc_mean_index)
+summary(lm_uhc)
+
+summary(lm_uhc)
+```
+
+### (4) Global Health Security index
+- Source: Global Health Security Index
+- Description: The GHS index is an assessment and benchmarking of health security and related capabilities, based on over 300 individual variables per country. Only the total index is extracted. 
+- Data cleaning done:
+  + We extract the overall score as a pre-calculated summary index for 2019 and 2021
+  + Explore data for pre- (2019) vs. during (2021) pandemic
+  + Simplify data to representative summary dataset, looking only at pre-pandemic (2019) as a pre-pandemic baseline
+  + Plot relationship between variable and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative
+
+#### Data cleaning
+```{r}
+# Import data
+file_path_ghs <- here::here("data", "2021-GHS-Index-April-2022.csv")
+
+ghs_data <- file_path_ghs %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+ghs_data
+
+ghs <- ghs_data %>%
+  filter(Year == 2019 | Year == 2021) %>%
+        mutate(iso_code = countrycode(Country,
+                                      origin = "country.name",
+                                      destination = "iso3c")) %>%
+        select(c(iso_code, year = Year, ghs_index = `OVERALL SCORE`)) %>%
+  pivot_wider(values_from = ghs_index, names_from = year, names_prefix = "ghs_index_")
+
+# Add to exploratory dataset
+explore %<>%
+  left_join(ghs, by = "iso_code")
+```
+
+#### Explore relationship
+```{r}
+# Compare trends for pre- and during pandemic developed indices
+ghs_scatter <- ggplot(data = explore)+
+  geom_point(aes(y = delta_total, x = ghs_index_2019, colour = "2019"))+
+  geom_smooth(aes(y = delta_total, x = ghs_index_2019, colour = "2019")) +
+  geom_point(aes(y = delta_total, x = ghs_index_2021, colour = "2021"))+
+  geom_smooth(aes(y = delta_total, x = ghs_index_2021, colour = "2021")) +
+  labs(x = "Global health security index", y = "DTP3 coverage delta \n(cumulative 2020-2022)")+
+  scale_colour_manual(values = wes_palette("BottleRocket2"),
+                      labels = c("GHS index 2019",
+                                 "GHS index 2021"),
+                      name = "Dataset")+
+  scale_y_lim+
+  theme+
+  hline
+  
+# Compare trends across years to see if can fit single line of best fit?
+ghs_annual <- ggplot(data = explore)+
+  geom_point(aes(x = ghs_index_2019, y = delta_2020, colour = "2020")) +
+  geom_smooth(aes(x = ghs_index_2019, y = delta_2020, colour = "2020"))+
+  geom_point(aes(x = ghs_index_2019, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = ghs_index_2019, y = delta_2021, colour = "2021"))+
+  geom_point(aes(x = ghs_index_2019, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = ghs_index_2019, y = delta_2022, colour = "2022"))+
+  labs(x = "Global health security index", y = "DTP3 coverage delta")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+ghs_explore <- plot_grid(ghs_scatter, ghs_annual, ncol = 2)
+ghs_explore
+```
+*Results:*
+- Similar trends for pre- and during- pandemic --> simplify to only look at pre-pandemic data for independent variable
+- Similar trends between independent variable for each year of the pandemic --> can summarise as single line of best fit across all years
+- We see a different relationship after GHS index > 35 therefore create an indicator for this
+
+#### Simplify data
+```{r}
+# Select 2019 Global health security assessment
+ghs %<>%
+  select(iso_code, ghs_index = ghs_index_2019) 
+
+# Add to tracker
+tracker %<>%
+  left_join(ghs, by = "iso_code")
+
+# Long dataset
+ghs_combo_dat <- tracker %>%
+  select(iso_code, ghs_index, delta_2020, delta_2021, delta_2022) %>%
+  pivot_longer(cols = !c(iso_code:ghs_index), names_prefix = "delta_", names_to = "year", values_to = "delta")
+
+tracker_combo %<>%
+  left_join(ghs_combo_dat, by = c("iso_code", "year", "delta"))
+
+```
+
+#### Final figures
+```{r}
+# Per year
+ghs_per_year <- ggplot(data = tracker)+
+  geom_point(aes(x = ghs_index, y = delta_2020, colour = "2020")) +
+  geom_smooth(aes(x = ghs_index, y = delta_2020, colour = "2020"))+
+  geom_point(aes(x = ghs_index, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = ghs_index, y = delta_2021, colour = "2021"))+
+  geom_point(aes(x = ghs_index, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = ghs_index, y = delta_2022, colour = "2022"))+
+  labs(x = "Global Health Security index (2019)", y = "DTP3 coverage delta")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+# Combined
+ghs_combo <- ggplot(data = tracker_combo)+
+  geom_point(aes(x = ghs_index, y = delta, colour = year))+
+  geom_smooth(aes(x = ghs_index, y = delta), colour = "darkgrey")+
+  scale_y_continuous(labels = percent_format(), limits = c(-0.3,+0.2))+
+  labs(x = "Global Health Security index (2019)", y = "DTP3 coverage delta")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+# Total
+ghs_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(y = delta_total, x = ghs_index))+
+  geom_smooth(aes(y = delta_total, x = ghs_index), colour = "darkgrey") +
+  labs(x = "Global Health Security index (2019)", y = "DTP3 coverage delta \n(cumulative 2020-2022)")+
+  scale_y+
+  theme+
+  hline
+
+ghs_plots <- plot_grid(ghs_per_year, ghs_combo, ghs_total, ncol = 3,
+                       labels = c("A", "B", "C"), label_size = 10) 
+ghs_plots
+
+# Save output
+ggsave(ghs_plots, 
+       filename = "../figures/pandemic_preparedness_final.png",
+       height = 10, width = 30, units = "cm")
+```
+
+
+#### Univariate model
+```{r}
+lm_ghs <- lm(data = tracker_combo, formula = delta ~ ghs_index)
+summary(lm_ghs)
+
+```
+
+### (5) COVID-19 vaccination
+- Source: Our World In Data data on the cumulative number of COVID-19 vaccinations administered per country per year
+- Description: Introduction and rollout of the COVID-19 vaccination at scale and speed required significant resources in-country, which may have required re-priortisation from other health services, including routine immunisation
+- Data cleaning completed: 
+  + We calculate total people vaccinated per hundred to give a relative measure of COVID-19 vaccination intensity per country per year, since each vaccination is an individual touch point with the health system
+  + Plot relationship between variable and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative
+- Only data for during pandemic (per year) therefore no pre-screening data cleaning to be done
+
+#### Data cleaning
+```{r}
+# Import data
+file_path_cov_vax <- here::here("data", "vaccinations.csv")
+
+covid_vax_data <- file_path_cov_vax %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+covid_vax_data
+
+# Clean data
+covid_vax <- covid_vax_data %>%
+  select(iso_code, daily_vaccinations, date) %>%
+  mutate(year = year(date)) %>%
+  arrange(iso_code, year) %>%
+  group_by(iso_code, year) %>%
+  summarise(total_vaccinations = sum(daily_vaccinations, na.rm = TRUE)) %>%
+  filter(year < 2023) %>% # focus on peak pandemic period 2020-2022
+  pivot_wider(values_from = total_vaccinations, 
+              names_from = year, names_prefix = "total_vaccinations_") %>%
+  select(iso_code, total_vaccinations_2020, total_vaccinations_2021, 
+         total_vaccinations_2022) %>%
+  mutate(total_vaccinations_2020 = replace_na(total_vaccinations_2020,
+                                            replace = 0)) 
+      # assume zero covid-19 vaccination if not reported
+
+# Creative relative 'vaccinations per capita' variable
+rel_calcs <- unwpp_wide_pop %>%
+  left_join(covid_vax, by = "iso_code") %>%
+  mutate(covid_vax_per_100k_2020 = round(total_vaccinations_2020 / (total_pop_2020/100000), digits = 1),
+         covid_vax_per_100k_2021 = round(total_vaccinations_2021 / (total_pop_2021/100000), digits = 1),
+         covid_vax_per_100k_2022 = round(total_vaccinations_2022 / (total_pop_2022/100000), digits = 1)) %>%
+  select(iso_code, covid_vax_per_100k_2020, 
+         covid_vax_per_100k_2021, 
+         covid_vax_per_100k_2022) %>%
+  mutate(covid_vx_total = covid_vax_per_100k_2020 + covid_vax_per_100k_2021 + covid_vax_per_100k_2022)
+
+# Add data to tracker
+tracker %<>%
+  left_join(rel_calcs, by = "iso_code")
+
+# Long dataset
+vx_combo_dat <- tracker %>%
+  select(iso_code, x1 = delta_2020, x2 = delta_2021, x3 = delta_2022, y1 = covid_vax_per_100k_2020, y2 = covid_vax_per_100k_2021, y3 = covid_vax_per_100k_2022)%>%
+  pivot_longer(!iso_code, 
+               cols_vary = "slowest", 
+               names_to = c(".value", "year"),
+               names_pattern = "(.)(.)") %>%
+  rename(delta = x, vx = y) %>%
+  mutate(year = as.factor(case_when(year == "1" ~ 2020,
+                          year == "2" ~ 2021,
+                          year == "3" ~ 2022)))
+
+tracker_combo %<>%
+  left_join(vx_combo_dat, by = c("iso_code", "year", "delta"))
+```
+
+#### Final figures
+```{r}
+# Per year
+covid_vax_scatter <- ggplot(data = tracker)+
+  geom_point(aes(y = delta_2020, x = covid_vax_per_100k_2020, colour = "2020"))+
+  geom_smooth(aes(y = delta_2020, x = covid_vax_per_100k_2020, colour = "2020")) +
+  geom_point(aes(y = delta_2021, x = covid_vax_per_100k_2021, colour = "2021"))+
+  geom_smooth(aes(y = delta_2021, x = covid_vax_per_100k_2021, colour = "2021")) +
+  geom_point(aes(y = delta_2022, x = covid_vax_per_100k_2022, colour = "2022"))+
+  geom_smooth(aes(y = delta_2022, x = covid_vax_per_100k_2022, colour = "2022")) +
+  labs(y = "DTP3 coverage delta", x = "COVID-19 vaccinations \nper 100,000 people")+
+  scale_x_continuous(labels = label_number(suffix = "k", accuracy = 1, scale = 0.001))+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+# Combined
+vx_combo <- ggplot(data = tracker_combo)+
+  geom_point(aes(x = vx, y = delta, colour = year))+
+  labs(y = "DTP3 coverage delta", x = "COVID-19 vaccinations \nper 100,000 people")+
+  geom_smooth(aes(x = vx, y = delta), colour = "darkgrey")+
+  scale_x_continuous(labels = label_number(suffix = "k", accuracy = 1, scale = 0.001))+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+# Total
+vx_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(x = covid_vx_total, y = delta_total))+
+  labs(x = "COVID-19 vaccinations per 100,000 \npeople (2020-2022 total)", y = "DTP3 coverage delta")+
+  geom_smooth(aes(x = covid_vx_total, y = delta_total), colour = "darkgrey")+
+  scale_x_continuous(labels = label_number(suffix = "k", accuracy = 1, scale = 0.001))+
+  scale_y+
+  theme+
+  hline
+
+vx_plot <- plot_grid(covid_vax_scatter, vx_combo, vx_total, ncol = 3, 
+                     labels = c("A", "B", "C"), label_size = 10)
+vx_plot
+
+# Save output
+ggsave(vx_plot, 
+       filename = "../figures/COVID-19_vx_final.png",
+       height = 10, width = 30, units = "cm")
+``` 
+
+#### Univariate model
+```{r}
+lm_cov_vx <- lm(data = tracker_combo, formula = delta ~ vx)
+summary(lm_cov_vx)
+```
+
+
+### (6) COVID-19 disease burden
+- Source: The Economist Excess Mortality cumulative estimates per year
+- Description: Rather than rely on COVID-19 case or reported death estimates - both of which are vulnerable to poor and incomparable reporting across countries - we use modelled excess mortality estimates from the Economist, to provide an indicator on the relative burden of the COVID-19 pandemic on mortality during the pandemic. 
+- Data cleaning completed: We extract cumulative excess mortality per 100,000 people in the population per year, for each year of the pandemic
+- Only data for during pandemic (per year) therefore no pre-screening data cleaning to be done
+- Plot relationship between variable and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative
+
+#### Data cleaning
+```{r}
+# Import data
+file_path_mortality_econ2 <- here::here("data", "excess-deaths-cumulative-per-100k-economist.csv")
+
+mortality_data_econ2 <- file_path_mortality_econ2 %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+mortality_data_econ2
+
+# clean data
+mort_dat_long <- mortality_data_econ2 %>%
+  mutate(Day = as.character(Day),
+         year = as.numeric(substr(Day, 1, 4))) %>%
+  filter(Day == "2020-12-28" | Day == "2021-12-27" | Day == "2022-12-26") %>% #Select year end data for each year only
+  select(iso_code = Code, year,
+         econ_mort_excess = `Cumulative excess deaths per 100,000 people (central estimate)`)
+
+mort_dat <- mort_dat_long %>%
+  pivot_wider(names_from = "year", names_prefix = "excess_mort_", 
+              values_from = "econ_mort_excess") %>%
+  mutate(excess_mortality_per_100kcapita_2020 = excess_mort_2020,
+         excess_mortality_per_100kcapita_2021 = excess_mort_2021 - excess_mort_2020,
+         excess_mortality_per_100kcapita_2022 = excess_mort_2022 - excess_mort_2021,
+         excess_mortality_total = excess_mort_2022) %>%
+  select(iso_code, excess_mortality_per_100kcapita_2020, 
+         excess_mortality_per_100kcapita_2021, excess_mortality_per_100kcapita_2022, 
+         excess_mortality_total)
+
+# Add data to tracker
+tracker %<>%
+  left_join(mort_dat, by = "iso_code")
+tracker
+
+# Long datset
+mortality_combo_dat <- tracker %>%
+  select(iso_code, x1 = delta_2020, x2 = delta_2021, x3 = delta_2022, y1 = excess_mortality_per_100kcapita_2020, y2 = excess_mortality_per_100kcapita_2021, y3 = excess_mortality_per_100kcapita_2022)%>%
+  pivot_longer(!iso_code, 
+               cols_vary = "slowest", 
+               names_to = c(".value", "year"),
+               names_pattern = "(.)(.)") %>%
+  rename(delta = x, mortality = y) %>%
+  mutate(year = as.factor(case_when(year == "1" ~ 2020,
+                          year == "2" ~ 2021,
+                          year == "3" ~ 2022))) 
+
+tracker_combo %<>%
+  left_join(mortality_combo_dat, by = c("iso_code", "year", "delta"))
+```
+
+#### Final figures
+```{r}
+# Per year
+mortality_scatter <- ggplot(data = tracker)+
+  geom_point(aes(y = delta_2020, x = excess_mortality_per_100kcapita_2020, colour = "2020"))+
+  geom_smooth(aes(y = delta_2020, x = excess_mortality_per_100kcapita_2020, colour = "2020")) +
+  geom_point(aes(y = delta_2021, x = excess_mortality_per_100kcapita_2021, colour = "2021"))+
+  geom_smooth(aes(y = delta_2021, x = excess_mortality_per_100kcapita_2021, colour = "2021")) +
+  geom_point(aes(y = delta_2022, x = excess_mortality_per_100kcapita_2022, colour = "2022"))+
+  geom_smooth(aes(y = delta_2022, x = excess_mortality_per_100kcapita_2022, colour = "2022")) +
+  labs(x = "Excess mortality per\n 100,000 people", y = "DTP3 coverage delta")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+# Combined
+mortality_combo <- ggplot(data = tracker_combo)+
+  geom_point(aes(x = mortality, y = delta, colour = year))+
+  labs(x = "Excess mortality per\n 100,000 people", y = "DTP3 coverage delta")+
+  geom_smooth(aes(x = mortality, y = delta), colour = "darkgrey")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+# Total
+mortality_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(x = excess_mortality_total, y = delta_total))+
+  labs(x = "Excess mortality per\n 100,000 people", y = "DTP3 coverage delta")+
+  geom_smooth(aes(x = excess_mortality_total, y = delta_total), colour = "darkgrey")+
+  scale_y+
+  theme+
+  hline
+
+mortality_plots <- plot_grid(mortality_scatter, mortality_combo, mortality_total, labels = c("A", "B", "C"), label_size = 10, ncol = 3)
+mortality_plots 
+
+# Save output
+ggsave(mortality_plots, 
+       filename = "../figures/excess_mortality_final.png",
+       height = 10, width = 30, units = "cm")
+```
+
+#### Univariate model
+```{r}
+lm_mort <- lm(data = tracker_combo, formula = delta ~ mortality)
+summary(lm_mort)
+```
+
+### (8-10) Health financing
+- Source: World Health Organisation - Global Health Expenditure Database
+- Description: We use Purchasing Power Parity (PPP) estimates of health financing across each source - government, external (e.g., donors), and private (e.g., OOP and insurance premiums)
+- Data cleaning completed:
+  + Explore data for pre- (2015-2019) vs. during pandemic (2020-2021; 2022 not available at time of analysis)
+  + Simplify data to representative summary dataset looking only at pre-pandemic for baseline
+  + Plot relationship between variable and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative
+
+#### Data cleaning
+```{r}
+# Import dataset
+file_path_hf_ppp <- here::here("data", "hf_ppp_2015_2022.csv")
+
+hf_ppp_data <- file_path_hf_ppp %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+hf_ppp_data
+
+# Clean data
+hf_ppp <- hf_ppp_data %>%
+  mutate(iso_code = countrycode(Countries,
+                                origin = "country.name",
+                                destination = "iso3c")) %>%
+  select(iso_code, indicator = Indicators,  `2015`, `2016`, `2017`, `2018`, `2019`, `2020`, `2021`) %>% #When 2022 is available, include that
+  mutate(`2015` = as.numeric(gsub(",", "",`2015`)),
+         `2016` = as.numeric(gsub(",", "",`2016`)),
+         `2017` = as.numeric(gsub(",", "",`2017`)),
+         `2018` = as.numeric(gsub(",", "",`2018`)),
+         `2019` = as.numeric(gsub(",", "",`2019`)),
+         `2020` = as.numeric(gsub(",", "",`2020`)),
+         `2021` = as.numeric(gsub(",", "",`2021`)))
+
+    ## Pre-pandemic average from 2015-2019
+    hf_ppp_pre_pandemic <- hf_ppp %>%
+      select(-c(`2020`,`2021`)) %>%
+      rowwise() %>%
+      mutate(average = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+      select(iso_code, indicator, average) %>%
+      pivot_wider(names_from = indicator,
+                  values_from = average) %>%
+      rename(che_pp = `Current Health Expenditure (CHE)`,
+             gov_pp = `Domestic General Government Health Expenditure (GGHE-D)`,
+             ext_pp = `External Health Expenditure (EXT)`,
+             private_pp = `Domestic Private Health Expenditure (PVT-D)`) %>%
+      mutate(che_pp = round(as.numeric(gsub(",", "",che_pp)), digits = 1),
+             gov_pp = round(as.numeric(gsub(",", "",gov_pp)), digits = 1),
+             ext_pp = round(as.numeric(gsub(",", "",ext_pp)), digits = 1),
+             private_pp = round(as.numeric(gsub(",", "",private_pp)), digits = 1),
+             ext_pp = replace_na(ext_pp, replace = 0)) 
+
+    ## Pandemic average: currently from 2020-2021, will add 2022 data when available
+    hf_ppp_pandemic <- hf_ppp %>%
+      select(c(iso_code,indicator,`2020`,`2021`)) %>%
+      rowwise() %>%
+      mutate(average = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+      select(iso_code, indicator, average) %>%
+      pivot_wider(names_from = indicator,
+                  values_from = average) %>%
+      rename(che = `Current Health Expenditure (CHE)`,
+             gov = `Domestic General Government Health Expenditure (GGHE-D)`,
+             ext = `External Health Expenditure (EXT)`,
+             private = `Domestic Private Health Expenditure (PVT-D)`) %>%
+      mutate(che = as.numeric(gsub(",", "",che)),
+             gov = as.numeric(gsub(",", "",gov)),
+             ext = as.numeric(gsub(",", "",ext)),
+             private = as.numeric(gsub(",", "",private)),
+             ext = replace_na(ext, replace = 0)) %>%
+      filter(!is.na(as.numeric(che))) # to remove non numeric values like Yemen
+    
+    ## Combine and calculate detlas
+    hf_ppp_calcs <- hf_ppp_pandemic %>%
+      left_join(hf_ppp_pre_pandemic, by = "iso_code") %>%
+      select(-c(che, che_pp)) %>% # Since working with components of health financing
+      mutate(gov_delta = gov - gov_pp,
+             ext_delta = ext - ext_pp,
+             private_delta = private - private_pp,
+             gov_perc_change = gov_delta/gov_pp,
+             ext_perc_change = ext_delta/ext_pp,
+             private_perc_change = private_delta/private_pp)
+
+#Add to exploratory dataset
+    explore %<>%
+      left_join(hf_ppp_calcs, by = "iso_code") %>%
+      mutate(across(where(is.numeric), ~na_if(., Inf))) %>%
+      mutate(across(where(is.numeric), ~na_if(., NaN)))    
+
+```
+
+#### Explore relationship
+```{r}
+# Since total health expenditure is comprised of three sources - government, private (e.g., OOP), and external - compare trends across each source to see if similar (and can look at total health expenditure) or distinct (and need to keep source variable in data)
+hf_sources <- ggplot(data = explore)+
+  geom_point(aes(x = gov_pp, y = delta_total, colour = "gov"))+
+  geom_smooth(aes(x = gov_pp, y = delta_total, colour = "gov"))+
+  geom_point(aes(x = ext_pp, y = delta_total, colour = "ext"))+
+  geom_smooth(aes(x = ext_pp, y = delta_total, colour = "ext"))+
+  geom_point(aes(x = private_pp, y = delta_total, colour = "priv"))+
+  geom_smooth(aes(x = private_pp, y = delta_total, colour = "priv"))+
+  labs(y = "DTP3 coverage delta \n(cumulative 2020-2022)", x = "Health financing expenditure ($ PPP)")+
+  scale_colour_manual(values = wes_palette("Darjeeling1", n = 3),
+                      labels = c("Government", 
+                                 "External",
+                                 "Private"),
+                      name = "Financing source")+
+  scale_y_lim +
+  theme+
+  hline
+             
+# Compare during vs. pre-pandemic trends - are there major differences or is it sufficient to look at pre-pandemic trends (to minimise risk of pandemic influence on data from during the pandemic?)
+hf_scatter_gov <- ggplot(data = explore)+
+  geom_point(aes(x = gov, y = delta_total, colour = "gov")) + 
+  geom_smooth(aes(x = gov, y = delta_total, colour = "gov"))+
+  geom_point(aes(x = gov_pp, y = delta_total, colour = "gov_pp")) +
+  geom_smooth(aes(x = gov_pp, y = delta_total, colour = "gov_pp"))+
+  labs(y = "DTP3 coverage delta \n(cumulative 2020-2022)", x = "Government health financing expenditure ($ PPP)")+
+  scale_colour_manual(values = wes_palette("BottleRocket2", n = 2),
+                      labels = c("During pandemic", 
+                                 "Pre-pandemic"),
+                      name = "Data range")+
+  scale_y_lim +
+  theme+
+  hline
+
+hf_scatter_private <- ggplot(data = explore)+
+  geom_point(aes(x = private, y = delta_total, colour = "private")) + 
+  geom_smooth(aes(x = private, y = delta_total, colour = "private"))+
+  geom_point(aes(x = private_pp, y = delta_total, colour = "private_pp")) +
+  geom_smooth(aes(x = private_pp, y = delta_total, colour = "private_pp"))+
+  labs(y = "DTP3 coverage delta \n(cumulative 2020-2022)", x = "Private health financing expenditure ($ PPP)")+
+  scale_colour_manual(values = wes_palette("BottleRocket2", n = 2),
+                      labels = c("During pandemic", 
+                                 "Pre-pandemic"),
+                      name = "Data range")+
+  scale_y_lim +
+  theme+
+  hline
+
+hf_scatter_ext <- ggplot(data = explore)+
+  geom_point(aes(x = ext, y = delta_total, colour = "ext")) + 
+  geom_smooth(aes(x = ext, y = delta_total, colour = "ext"))+
+  geom_point(aes(x = ext_pp, y = delta_total, colour = "ext_pp")) +
+  geom_smooth(aes(x = ext_pp, y = delta_total, colour = "ext_pp"))+
+  labs(y = "DTP3 coverage delta \n(cumulative 2020-2022)", x = "External health financing expenditure ($ PPP)")+
+  scale_colour_manual(values = wes_palette("BottleRocket2", n = 2),
+                      labels = c("During pandemic", 
+                                 "Pre-pandemic"),
+                      name = "Data range")+
+  scale_y_lim +
+  theme+
+  hline
+
+# Compare trends across each year of data - are trends similar to allow fitting single line of best fit across all data combined? 
+
+hf_explore <- plot_grid(hf_sources, hf_scatter_gov, hf_scatter_private, hf_scatter_ext, labels = c("All", "Government", "Private", "External"), label_size = 10, ncol = 2, nrow = 2)
+hf_explore
+```
+*Results:*
+- Distinct trends pre health financing source, particularly since on very different scales --> keep sources distinct
+- Similar trends for pre- and during- pandemic --> simplify to only look at pre-pandemic data for independent variable
+- Most datapoints are on the left handside of the figures --> useful to zoom in to look at the trends in those areas
+
+#### Simplify data
+```{r}
+# Simplify data to a single index across 2015-2019 since similar trends
+hf_ppp_calcs %<>% select(c(iso_code, gov = gov_pp, private = private_pp, ext = ext_pp)) 
+
+# Add to tracker
+tracker %<>%
+  left_join(hf_ppp_calcs, by = "iso_code")
+
+# Long dataset
+  gov_combo_dat <- tracker %>%
+    select(iso_code, gov, delta_2020, delta_2021, delta_2022) %>%
+    pivot_longer(cols = !(iso_code:gov), values_to = "delta", names_to = "year", names_prefix = "delta_") %>%
+    select(iso_code, year, delta, gov)
+    
+  ext_combo_dat <- tracker %>%
+    select(iso_code, ext, delta_2020, delta_2021, delta_2022) %>%
+    pivot_longer(cols = !(iso_code:ext), values_to = "delta", names_to = "year", names_prefix = "delta_") %>%
+    select(iso_code, year, delta, ext)
+  
+  priv_combo_dat <- tracker %>%
+    select(iso_code, private, delta_2020, delta_2021, delta_2022) %>%
+    pivot_longer(cols = !(iso_code:private), values_to = "delta", names_to = "year", names_prefix = "delta_") %>%
+    select(iso_code, year, delta, private)
+  
+  hf_combo_dat <- gov_combo_dat %>%
+    left_join(ext_combo_dat, by = c("iso_code", "year", "delta")) %>%
+    left_join(priv_combo_dat, by = c("iso_code", "year", "delta"))
+
+tracker_combo %<>%
+  left_join(hf_combo_dat, by = c("iso_code", "year", "delta"))
+```
+
+#### Final figures
+``` {r}
+# Per year
+gov_per_year <- ggplot(data = tracker)+
+  geom_point(aes(x = gov, y = delta_2020, colour = "2020"))+
+  geom_smooth(aes(x = gov, y = delta_2020, colour = "2020")) +
+  geom_point(aes(x = gov, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = gov, y = delta_2021, colour = "2021")) +
+  geom_point(aes(x = gov, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = gov, y = delta_2022, colour = "2022")) +
+  labs(y = "DTP3 coverage delta", x = "Government health financing (mean 2015-2019; $ PPP)")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+ext_per_year <- ggplot(data = tracker)+
+  geom_point(aes(x = ext, y = delta_2020, colour = "2020"))+
+  geom_smooth(aes(x = ext, y = delta_2020, colour = "2020")) +
+  geom_point(aes(x = ext, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = ext, y = delta_2021, colour = "2021")) +
+  geom_point(aes(x = ext, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = ext, y = delta_2022, colour = "2022")) +
+  labs(y = "DTP3 coverage delta", x = "External health financing (mean 2015-2019; $ PPP)")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+private_per_year <- ggplot(data = tracker)+
+  geom_point(aes(x = private, y = delta_2020, colour = "2020"))+
+  geom_smooth(aes(x = private, y = delta_2020, colour = "2020")) +
+  geom_point(aes(x = private, y = delta_2021, colour = "2021")) +
+  geom_smooth(aes(x = private, y = delta_2021, colour = "2021")) +
+  geom_point(aes(x = private, y = delta_2022, colour = "2022")) +
+  geom_smooth(aes(x = private, y = delta_2022, colour = "2022")) +
+  labs(y = "DTP3 coverage delta", x = "Government health financing (mean 2015-2019; $ PPP)")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+hf_plots_per_year <- plot_grid(gov_per_year, ext_per_year, private_per_year,
+                             labels = c("Gov", "Ext", "Priv"), align= "h",
+                             ncol = 3, rel_widths = c(1,1,1), label_size = 10)
+
+# Combined
+  # Government
+  gov_combo <- ggplot(data = tracker_combo)+
+    geom_point(aes(x = gov, y = delta, colour = year))+
+    geom_smooth(aes(x = gov, y = delta), colour = "darkgrey")+
+    labs(y = "DTP3 coverage delta", x = "Government health financing (mean 2015-2019; $ PPP)")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline    
+  
+  # External
+  ext_combo <- ggplot(data = tracker_combo)+
+    geom_point(aes(x = ext, y = delta, colour = year))+
+    geom_smooth(aes(x = ext, y = delta), colour = "darkgrey")+
+    labs(y = "DTP3 coverage delta", x = "External health financing (mean 2015-2019; $ PPP)")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline      
+  
+  # Private
+  private_combo <- ggplot(data = tracker_combo)+
+    geom_point(aes(x = private, y = delta, colour = year))+
+    geom_smooth(aes(x = private, y = delta), colour = "darkgrey")+
+    labs(y = "DTP3 coverage delta", x = "Private health financing (mean 2015-2019; $ PPP)")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline  
+  
+  hf_plots_combos <- plot_grid(gov_combo, ext_combo, private_combo, 
+                              labels = c("Gov", "Ext", "Priv"), align= "h", 
+                              ncol = 3, rel_widths = c(1,1,1), label_size = 10)
+
+# Zoom in versions to look at trends for the majority of countries
+  gov_combo_zoom <- ggplot(data = tracker_combo)+
+    geom_point(aes(x = gov, y = delta, colour = year))+
+    geom_smooth(aes(x = gov, y = delta), colour = "darkgrey")+
+    scale_x_continuous(limits = c(0,2000))+
+    labs(y = "DTP3 coverage delta", x = "Government health financing (mean 2015-2019; $ PPP)")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline
+  
+  ext_combo_zoom <- ggplot(data = tracker_combo)+
+    geom_point(aes(x = ext, y = delta, colour = year))+
+    geom_smooth(aes(x = ext, y = delta), colour = "darkgrey")+
+    scale_x_continuous(limits = c(0,100))+
+    labs(y = "DTP3 coverage delta", x = "External health financing (mean 2015-2019; $ PPP)")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline
+    
+  private_combo_zoom <- ggplot(data = tracker_combo)+
+    geom_point(aes(x = private, y = delta, colour = year))+
+    geom_smooth(aes(x = private, y = delta), colour = "darkgrey")+
+    scale_x_continuous(limits = c(0,1500))+
+    labs(y = "DTP3 coverage delta", x = "Private health financing (mean 2015-2019; $ PPP)")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline
+  
+  hf_plots_zoom <- plot_grid(gov_combo_zoom, ext_combo_zoom, private_combo_zoom, 
+                              labels = c("Gov", "Ext", "Priv"), align= "h", 
+                              ncol = 3, rel_widths = c(1,1,1), label_size = 10)
+  
+# Total
+gov_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(x = gov, y = delta_total, ))+
+  geom_smooth(aes(x = gov, y = delta_total), colour = "darkgrey") +
+  labs(y = "DTP3 coverage delta (cumulative, 2020-2022)", x = "Government health financing (mean 2015-2019; $ PPP)")+
+  scale_y+
+  theme+
+  hline
+
+ext_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(x = ext, y = delta_total, ))+
+  geom_smooth(aes(x = ext, y = delta_total), colour = "darkgrey") +
+  labs(y = "DTP3 coverage delta (cumulative, 2020-2022)", x = "External health financing (mean 2015-2019; $ PPP)")+
+  scale_y+
+  theme+
+  hline
+
+private_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(x = private, y = delta_total, ))+
+  geom_smooth(aes(x = private, y = delta_total), colour = "darkgrey") +
+  labs(y = "DTP3 coverage delta (cumulative, 2020-2022)", x = "Private health financing (mean 2015-2019; $ PPP)")+
+  scale_y+
+  theme+
+  hline
+
+hf_plots_total <- plot_grid(gov_total, ext_total, private_total,
+                            labels = c("Gov", "Ext", "Priv"), align= "h",
+                            ncol = 3, rel_widths = c(1,1,1), label_size = 10)
+
+# Output
+hf_plots_all <- plot_grid(hf_plots_per_year, hf_plots_combos, hf_plots_zoom, hf_plots_total, nrow = 4, rel_heights = c(1,1,1,1))
+
+hf_plots_all
+
+# Output per source
+gov_plots <- plot_grid(gov_per_year, gov_combo, gov_total, gov_combo_zoom, 
+                             labels = c("A", "B", "C", "D"), align= "h",
+                             ncol = 2, rel_widths = c(1,1,1,1), label_size = 10)
+
+ext_plots <- plot_grid(ext_per_year, ext_combo, ext_total, ext_combo_zoom,
+                             labels = c("A", "B", "C", "D"), align= "h",
+                             ncol = 2, rel_widths = c(1,1,1,1), label_size = 10)
+ext_plots
+
+private_plots <- plot_grid(private_per_year, private_combo, private_total, private_combo_zoom,
+                             labels = c("A", "B", "C", "D"), align= "h",
+                             ncol = 2, rel_widths = c(1,1,1,1), label_size = 10)
+private_plots
+
+# Save output
+ggsave(gov_plots, 
+       filename = "../figures/gov_plots_final.png",
+       height = 22, width = 30, units = "cm")
+
+ggsave(ext_plots, 
+       filename = "../figures/ext_plots_final.png",
+       height = 22, width = 30, units = "cm")
+
+ggsave(private_plots, 
+       filename = "../figures/private_plots_final.png",
+       height = 22, width = 30, units = "cm")
+
+```
+
+
+#### Univariate model
+```{r}
+# Government expenditure
+lm_hf <- lm(data = tracker_combo, formula = delta ~ gov + ext + private)
+summary(lm_hf)
+```
+
+### (13) Country income - GDP
+- Source: World Bank DataBank: World Development Indicators
+- Description: We use Purchasing Power Parity (PPP) estimates of Gross Domestic Product (pre-scaled) per capita
+- Data cleaning completed:
+  + Calculate pre-pandemic baseline, i.e., 2015-2019 mean
+  + Plot relationship between variable and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative
+- Add cleaned GDP index to tracker
+- Note we do not explore including during pandemic index (e.g., 2020-2022) since the broader economy may have been affected by the impact of the pandemic on the economy
+
+#### Data cleaning
+```{r}
+# Import data
+file_path_gdp <- here::here("data", "World_Bank_GDP_per_capita_PPP.csv")
+
+gdp_data <- file_path_gdp %>%
+  rio::import(header = TRUE, skip = 4) %>%
+  tibble()
+gdp_data
+
+# Clean data
+gdp <- gdp_data %>%
+  select(iso_code = `Country Code`,
+         `2015`, `2016`, `2017`, `2018`, `2019`) %>%
+  rowwise() %>%
+  mutate(average_gdp = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  select(iso_code, average_gdp) 
+# Add data to tracker
+tracker %<>%
+  left_join(gdp, by = "iso_code")
+tracker
+
+# Long dataset
+gdp_combo_dat <- tracker %>%
+  select(iso_code, average_gdp, delta_2020, delta_2021, delta_2022) %>%
+  pivot_longer(cols = !c(iso_code:average_gdp), names_prefix = "delta_", names_to = "year", values_to = "delta")
+
+tracker_combo %<>%
+  left_join(gdp_combo_dat, by = c("iso_code", "year", "delta"))
+
+```
+
+#### Final figures
+```{r}
+# Per year
+gdp_scatter_per_year <- ggplot(data = tracker)+
+  geom_point(aes(y = delta_2020, x = average_gdp, colour = "2020"))+
+  geom_smooth(aes(y = delta_2020, x = average_gdp, colour = "2020"))+
+  geom_point(aes(y = delta_2021, x = average_gdp, colour = "2021"))+
+  geom_smooth(aes(y = delta_2021, x = average_gdp, colour = "2021"))+
+  geom_point(aes(y = delta_2022, x = average_gdp, colour = "2022"))+
+  geom_smooth(aes(y = delta_2022, x = average_gdp, colour = "2022"))+
+  labs(y = "DTP3 coverage delta", x = "Pre-pandemic GDP per capita \n(mean 2015-2019, PPP)")+
+  scale_x_continuous(labels = label_number(scale = 0.001, suffix = "k", accuracy = 1), limits = c(0,60000))+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+
+# Combined
+gdp_combo <- ggplot(data = tracker_combo)+
+  geom_point(aes(x = average_gdp, y = delta, colour = year))+
+  geom_smooth(aes(x = average_gdp, y = delta), colour = "darkgrey")+
+  scale_x_continuous(labels = label_number(scale = 0.001, suffix = "k", accuracy = 1), limits = c(0,60000))+
+  labs(y = "DTP3 coverage delta", x = "Pre-pandemic GDP per capita \n(mean 2015-2019, PPP)")+
+  colour+
+  scale_y_lim+
+  theme+
+  hline
+  
+# Total
+gdp_scatter <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+  geom_point(aes(y = delta_total, x = average_gdp))+
+  geom_smooth(aes(y = delta_total, x = average_gdp), colour = "darkgrey") +
+  labs(y = "DTP3 coverage delta \n(cumulative 2020-2022)", x = "Pre-pandemic GDP per capita \n(mean 2015-2019, PPP)")+
+  scale_x_continuous(labels = label_number(scale = 0.001, suffix = "k", accuracy = 1), limits = c(0,60000))+
+  scale_y+
+  theme+
+  hline
+
+gdp_plots <- plot_grid(gdp_scatter_per_year, gdp_combo, gdp_scatter, ncol = 3, labels = c("A", "B", "C"), label_size = 10)
+gdp_plots
+
+# Output
+ggsave(gdp_plots, 
+       filename = "../figures/gdp_plots_final.png",
+       height = 10, width = 30, units = "cm")
+
+```
+
+#### Univariate model
+```{r}
+lm_gdp <- lm(data = tracker_combo, formula = delta ~ average_gdp)
+summary(lm_gdp)
+
+```
+
+### (7, and 13-14) COVID-19 policy responses
+- Source: Oxford COVID-19 Government Response Tracker (Ox-CGRT)
+- Description: During the pandemic, countries introduced varied response measures, e.g., lockdowns or school closures, with varying levels of stringency and periods of time. The Oxford COVID-19 Government Response Trackers (OxCGRT) monitored and codified these responses daily during the pandemic to create a set of indices (not MECE). Relevant here as quantitative descriptions of COVID-19 policy responses that may have influenced access to or quality of routine health services, including routine immunisation
+- Data cleaning done:
+  + We first exclude indicators that are reported as unreliable by the source code
+  + We then group by the pre-provided categories of data: containment measures summarising access to certain locations, economic measures summarising fiscal support, and health measures summarising policies on individual health protecting behaviours. All measures are pre-codified to indicate stringency on comparable scales
+  + We then use Principal Components Analysis on each category of data to extract only the first principal component as an indicator respectively on containment strength, economic support strength, and health policy strength
+  + Plot relationship between variable and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative
+
+#### Data cleaning
+```{r}
+# Import data
+file_path_policy <- here::here("data", "OxCGRT_compact_national_v1.csv")
+
+policy_data <- file_path_policy %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+policy_data
+
+# Clean data
+policy <- policy_data %>%
+  filter(Jurisdiction == "NAT_TOTAL") %>% #Check that policies apply at national level
+  mutate(year = substr(Date, 1, 4),
+         month = substr(Date, 5, 6),
+         day = substr(Date, 7, 8),
+         date = dmy(paste(day, month, year, sep = "-"))) %>%
+  select(iso_code = CountryCode,
+         year,
+         c1m_school = `C1M_School closing`,
+         c2m_work = `C2M_Workplace closing`,
+         c3m_events = `C3M_Cancel public events`,
+         c4m_gatherings = `C4M_Restrictions on gatherings`,
+         c5m_public_transit = `C5M_Close public transport`,
+         c6m_stay_at_home = `C6M_Stay at home requirements`,
+         c7m_internal_mov = `C7M_Restrictions on internal movement`,
+         c8ev_international_travel = `C8EV_International travel controls`,
+         e1_income_support = `E1_Income support`,
+         e2_debt_relief = `E2_Debt/contract relief`,
+         e3_fiscal_measures = `E3_Fiscal measures`,
+         e4_international_support = `E4_International support`,
+         h1_public_info = `H1_Public information campaigns`,
+         h2_testing_policy = `H2_Testing policy`,
+         h3_contact_tracing = `H3_Contact tracing`,
+         h4_healthcare_invest = `H4_Emergency investment in healthcare`,
+         h5_vx_invest = `H5_Investment in vaccines`,
+         h6m_masks = `H6M_Facial Coverings`,
+         h7_vx_policy = `H7_Vaccination policy`,
+         h8m_elderly = `H8M_Protection of elderly people`) %>%
+  group_by(iso_code, year) %>%
+  summarise(across(everything(), mean)) %>% #if want both summaries use (mean = mean, median = median)
+  select(-c(e3_fiscal_measures,
+            e4_international_support,
+            h4_healthcare_invest,
+            h5_vx_invest)) #Remove 4 variables since noted as incomplete/need caution
+
+# Use PCA to summarise each category of policy indicators
+
+    ## Labels for extracting transformed variables
+      labels <- policy %>%
+        select(iso_code, year)
+      
+    ## Investivate containment indices
+      containment_corr <- cor(policy[(3:10)])
+      corrplot(containment_corr)
+      
+      containment_pca <- policy[3:10] %>%
+        prcomp(center = TRUE, scale = TRUE, retx = TRUE)
+      
+      summary(containment_pca)
+      
+          ### Describe most important indicators 
+            containment_pca_loadings <- data.frame(containment_pca$rotation) %>%
+              arrange(PC1, desc = TRUE)
+            containment_pca_loadings
+            
+            fviz_pca_var(containment_pca, col.var = "black")
+            fviz_eig(containment_pca, addlabels = TRUE)
+
+            containment_pc1_bar <- fviz_contrib(containment_pca, choice = "var", axes = 1) #Change axes = x for each PC
+            containment_pc1_bar
+            
+          ### Transform original dataset
+            extract_containment_values <- containment_pca$x[,1] %>% as_tibble()
+
+            containment_transformed <- labels %>%
+              cbind(extract_containment_values) %>%
+              rename(containment_PC1 = value) %>%
+              mutate(containment_PC1 = -1*containment_PC1) %>%
+              pivot_wider(names_from = year, names_prefix = "containment_PC1_", values_from = containment_PC1)
+            
+    ## Investivate economic indices
+      economic_corr <- cor(policy[(11:12)])
+      corrplot(economic_corr)
+      
+      economic_pca <- policy[,11:12] %>%
+        prcomp(center = TRUE, scale = TRUE)
+      
+      summary(economic_pca)
+      
+          ### Describe most important indicators 
+            economic_pca_loadings <- data.frame(economic_pca$rotation) %>%
+              arrange(PC1, desc = TRUE)
+            economic_pca_loadings
+            
+            fviz_pca_var(economic_pca, col.var = "black")
+            fviz_eig(economic_pca, addlabels = TRUE)
+
+            economic_pc1_bar <- fviz_contrib(economic_pca, choice = "var", axes = 1) #Change axes = x for each PC
+            economic_pc1_bar
+            
+          ### Transform original dataset
+            extract_economic_values <- economic_pca$x[,1] %>% as_tibble()
+
+            economic_transformed <- labels %>%
+              cbind(extract_economic_values) %>%
+              rename(economic_PC1 = value) %>%
+              mutate(economic_PC1 = economic_PC1*-1) %>%
+              pivot_wider(names_from = year, names_prefix = "economic_PC1_", values_from = economic_PC1)
+            
+    ## Investivate health indices - exclude elderly since likely not related to vaccination of infants (?)
+      health_corr <- cor(policy[(13:18)])
+      corrplot(health_corr)
+      
+      health_pca <- policy[,13:18] %>%
+        prcomp(center = TRUE, scale = TRUE)
+      
+      summary(health_pca)
+      
+          ### Describe most important indicators 
+            health_pca_loadings <- data.frame(health_pca$rotation) %>%
+              arrange(PC1, desc = TRUE)
+            health_pca_loadings
+            
+            fviz_pca_var(health_pca, col.var = "black")
+            fviz_eig(health_pca, addlabels = TRUE)
+        
+            health_pc2_bar <- fviz_contrib(health_pca, choice = "var", axes = 2) #Change axes = x for each PC
+            health_pc2_bar
+            
+          ### Transform original dataset
+            # Principal Component 1
+            extract_health_values_PC1 <- health_pca$x[,1] %>% as_tibble()
+            health_transformed1 <- labels %>%
+              cbind(extract_health_values_PC1) %>%
+              rename(health_PC1 = value)  %>%
+              pivot_wider(names_from = year, names_prefix = "health_PC1_", values_from = health_PC1)
+            
+            # Principal Component 2
+            extract_health_values_PC2 <- health_pca$x[,2] %>% as_tibble()
+            health_transformed2 <- labels %>%
+              cbind(extract_health_values_PC2) %>%
+              rename(health_PC2 = value)  %>%
+              pivot_wider(names_from = year, names_prefix = "health_PC2_", values_from = health_PC2)
+            
+            # Combine
+            health_transformed <- health_transformed1 %>%
+              left_join(health_transformed2, by = "iso_code")
+            
+# Add data to tracker
+policy_tracker <- containment_transformed %>%
+  left_join(economic_transformed, by = "iso_code") %>%
+  left_join(health_transformed, by = "iso_code")
+
+tracker %<>%
+  left_join(policy_tracker, by = "iso_code")
+
+# Investigate colinearity of summary variables
+policy_cor <- cor(policy_tracker[-1])
+corrplot(policy_cor)
+  # Health PC1 and Economic PC1 appear fully inversely correlated?
+
+# Long dataset
+    containment_combo_dat <- tracker %>%
+      select(iso_code, x1 = delta_2020, x2 = delta_2021, x3 = delta_2022, 
+             y1 = containment_PC1_2020, y2 = containment_PC1_2021, y3 = containment_PC1_2022) %>%
+      pivot_longer(!iso_code, 
+                   cols_vary = "slowest", 
+                   names_to = c(".value", "year"),
+                   names_pattern = "(.)(.)") %>%
+      rename(delta = x, containment = y) %>%
+      mutate(year = as.factor(case_when(year == "1" ~ 2020,
+                              year == "2" ~ 2021,
+                              year == "3" ~ 2022)))  
+    
+    econ_combo_dat <- tracker %>%
+      select(iso_code, x1 = delta_2020, x2 = delta_2021, x3 = delta_2022, 
+             y1 = economic_PC1_2020, y2 = economic_PC1_2021, y3 = economic_PC1_2022) %>%
+      pivot_longer(!iso_code, 
+                   cols_vary = "slowest", 
+                   names_to = c(".value", "year"),
+                   names_pattern = "(.)(.)") %>%
+      rename(delta = x, economic = y) %>%
+      mutate(year = as.factor(case_when(year == "1" ~ 2020,
+                              year == "2" ~ 2021,
+                              year == "3" ~ 2022)))  
+    
+    health_combo_dat1 <- tracker %>%
+      select(iso_code, x1 = delta_2020, x2 = delta_2021, x3 = delta_2022, 
+             y1 = health_PC1_2020, y2 = health_PC1_2021, y3 = health_PC1_2022)%>%
+      pivot_longer(!iso_code, 
+                   cols_vary = "slowest", 
+                   names_to = c(".value", "year"),
+                   names_pattern = "(.)(.)") %>%
+      rename(delta = x, healthPC1 = y) %>%
+      mutate(year = as.factor(case_when(year == "1" ~ 2020,
+                              year == "2" ~ 2021,
+                              year == "3" ~ 2022)))  
+  
+    health_combo_dat2 <- tracker %>%
+      select(iso_code, x1 = delta_2020, x2 = delta_2021, x3 = delta_2022, 
+             y1 = health_PC2_2020, y2 = health_PC2_2021, y3 = health_PC2_2022)%>%
+      pivot_longer(!iso_code, 
+                   cols_vary = "slowest", 
+                   names_to = c(".value", "year"),
+                   names_pattern = "(.)(.)") %>%
+      rename(delta = x, healthPC2 = y) %>%
+      mutate(year = as.factor(case_when(year == "1" ~ 2020,
+                              year == "2" ~ 2021,
+                              year == "3" ~ 2022)))  
+    
+tracker_combo %<>%
+  left_join(containment_combo_dat, by = c("iso_code", "year", "delta")) %>%
+  left_join(econ_combo_dat, by = c("iso_code", "year", "delta")) %>%
+  left_join(health_combo_dat1, by = c("iso_code", "year", "delta")) %>%
+  left_join(health_combo_dat2, by = c("iso_code", "year", "delta"))
+
+# Create means for PCA variables for plotting totals
+  pca_vars <- tracker %>%
+    select(iso_code, delta_total, containment_PC1_2020:health_PC2_2022) %>%
+    mutate(mean_containment = apply(select(., containment_PC1_2020,
+                                                  containment_PC1_2021,
+                                                  containment_PC1_2022), 1, mean, na.rm = TRUE),
+            mean_healthPC1 = apply(select(., health_PC1_2020, 
+                                                health_PC1_2021, 
+                                                health_PC1_2022), 1, mean, na.rm = TRUE),
+            mean_healthPC2 = apply(select(., health_PC2_2020, 
+                                                health_PC2_2021, 
+                                                health_PC2_2022), 1, mean, na.rm = TRUE),
+            mean_economic = apply(select(., economic_PC1_2020, 
+                                              economic_PC1_2021, 
+                                              economic_PC1_2022), 1, mean, na.rm = TRUE)) %>%
+    select(iso_code, delta_total, mean_containment, mean_economic, mean_healthPC1, 
+           mean_healthPC2)
+```
+
+#### Final figures
+```{r}
+# Per year
+  # Containment
+  containment_scatter <- ggplot(data = tracker)+
+    geom_point(aes(x = containment_PC1_2020, y = delta_2020, colour = "2020"))+
+    geom_smooth(aes(x = containment_PC1_2020, y = delta_2020, colour = "2020")) +
+    geom_point(aes(x = containment_PC1_2021, y = delta_2021, colour = "2021"))+
+    geom_smooth(aes(x = containment_PC1_2021, y = delta_2021, colour = "2021")) +
+    geom_point(aes(x = containment_PC1_2022, y = delta_2022, colour = "2022"))+
+    geom_smooth(aes(x = containment_PC1_2022, y = delta_2022, colour = "2022")) +
+    labs(x = "Containment policy, stringency", y ="DTP3 coverage delta")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline
+
+  # Economic
+  economic_scatter <- ggplot(data = tracker)+
+    geom_point(aes(x = economic_PC1_2020, y = delta_2020, colour = "2020"))+
+    geom_smooth(aes(x = economic_PC1_2020, y = delta_2020, colour = "2020")) +
+    geom_point(aes(x = economic_PC1_2021, y = delta_2021, colour = "2021"))+
+    geom_smooth(aes(x = economic_PC1_2021, y = delta_2021, colour = "2021")) +
+    geom_point(aes(x = economic_PC1_2022, y = delta_2022, colour = "2022"))+
+    geom_smooth(aes(x = economic_PC1_2022, y = delta_2022, colour = "2022")) +
+    labs(x = "Economic policy stringency", y = "DTP3 coverage delta")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline    
+  
+  # Health indices
+  health_scatter1 <- ggplot(data = tracker)+
+    geom_point(aes(y = delta_2020, x = health_PC1_2020, colour = "2020"))+
+    geom_smooth(aes(y = delta_2020, x = health_PC1_2020, colour = "2020")) +
+    geom_point(aes(y = delta_2021, x = health_PC1_2021, colour = "2021"))+
+    geom_smooth(aes(y = delta_2021, x = health_PC1_2021, colour = "2021")) +
+    geom_point(aes(y = delta_2022, x = health_PC1_2022, colour = "2022"))+
+    geom_smooth(aes(y = delta_2022, x = health_PC1_2022, colour = "2022")) +
+    labs(x = "Health policy stringency \n (Principal Component 1)", y = "DTP3 coverage delta")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline
+  
+  health_scatter2 <- ggplot(data = tracker)+
+    geom_point(aes(y = delta_2020, x = health_PC2_2020, colour = "2020"))+
+    geom_smooth(aes(y = delta_2020, x = health_PC2_2020, colour = "2020")) +
+    geom_point(aes(y = delta_2021, x = health_PC2_2021, colour = "2021"))+
+    geom_smooth(aes(y = delta_2021, x = health_PC2_2021, colour = "2021")) +
+    geom_point(aes(y = delta_2022, x = health_PC2_2022, colour = "2022"))+
+    geom_smooth(aes(y = delta_2022, x = health_PC2_2022, colour = "2022")) +
+    labs(x = "Health policy stringency \n (Principal Component 2)", y = "DTP3 coverage delta")+
+    colour+
+    scale_y_lim+
+    theme+
+    hline
+
+# Per year output
+policy_per_year <- plot_grid(containment_scatter, economic_scatter, health_scatter1, health_scatter2, labels = c("Containment", "Economic", "Health PC1", "Health PC2"), ncol = 2)
+
+# Combined
+  # Containment
+      containment_combo <- ggplot(data = tracker_combo)+
+      geom_point(aes(x = containment, y = delta, colour = year))+
+      labs(x = "Containment policy stringency", y = "DTP3 coverage delta")+
+      geom_smooth(aes(x = containment, y = delta), colour = "darkgrey")+
+      scale_y_continuous(labels = percent_format())+
+      colour+
+      theme+
+      scale_y_lim+
+      hline
+    
+  # Economic
+      economic_combo <- ggplot(data = tracker_combo)+
+      geom_point(aes(x = economic, y = delta, colour = year))+
+      labs(x = "Economic policy stringency", y = "DTP3 coverage delta")+
+      geom_smooth(aes(x = economic, y = delta), colour = "darkgrey")+
+      colour+
+      theme+
+      scale_y_lim+
+      hline
+    
+  # Health
+    health_combo1 <- ggplot(data = tracker_combo)+
+      geom_point(aes(x = healthPC1, y = delta, colour = year))+
+      labs(x = "Health policy stringency \n (Principal Component 1)", y = "DTP3 coverage delta")+
+      geom_smooth(aes(x = healthPC1, y = delta), colour = "darkgrey")+
+      colour+
+      theme+
+      scale_y_lim+
+      hline
+    
+     health_combo2 <- ggplot(data = tracker_combo)+
+      geom_point(aes(x = healthPC2, y = delta, colour = year))+
+      labs(x = "Health policy stringency \n (Principal Component 2)", y = "DTP3 coverage delta")+
+      geom_smooth(aes(x = healthPC2, y = delta), colour = "darkgrey")+
+      colour+
+      theme+
+      scale_y_lim+
+      hline
+
+# Totals
+  containment_total <- ggplot(data = pca_vars %>% filter(iso_code != "VNM"))+
+    geom_point(aes(x = mean_containment, y = delta_total))+
+    geom_smooth(aes(x = mean_containment, y = delta_total), colour = "darkgrey")+
+    labs(x = "Containment policy stringency\n(mean 2020-2022)",
+         y = "DTP3 coverage delta\n(cumulative 2020-2022)")+
+    scale_y+
+    theme+
+    hline
+  
+  economic_total <- ggplot(data = pca_vars %>% filter(iso_code != "VNM"))+
+    geom_point(aes(x = mean_economic, y = delta_total))+
+    geom_smooth(aes(x = mean_economic, y = delta_total), colour = "darkgrey")+
+    labs(x = "Economic policy stringency\n(mean 2020-2022)",
+         y = "DTP3 coverage delta\n(cumulative 2020-2022)")+
+    scale_y+
+    theme+
+    hline
+  
+  healthPC1_total <- ggplot(data = pca_vars %>% filter(iso_code != "VNM"))+
+    geom_point(aes(x = mean_healthPC1, y = delta_total))+
+    geom_smooth(aes(x = mean_healthPC1, y = delta_total), colour = "darkgrey")+
+    labs(x = "Health policy stringency - Principal\nComponent 1 (mean 2020-2022)",
+         y = "DTP3 coverage delta\n(cumulative 2020-2022)")+
+    scale_y+
+    theme+
+    hline
+  
+  healthPC2_total <- ggplot(data = pca_vars %>% filter(iso_code != "VNM"))+
+    geom_point(aes(x = mean_healthPC2, y = delta_total))+
+    geom_smooth(aes(x = mean_healthPC2, y = delta_total), colour = "darkgrey")+
+    labs(x = "Health policy stringency - Principal\nComponent 2 (mean 2020-2022)",
+         y = "DTP3 coverage delta\n(cumulative 2020-2022)")+
+    scale_y+
+    theme+
+    hline
+     
+# Output per policy
+containment_plots <- plot_grid(containment_scatter, containment_combo, containment_total,
+                               labels = c("A", "B", "C"), ncol = 3)
+economic_plots <- plot_grid(economic_scatter, economic_combo, economic_total,
+                            labels = c("A", "B", "C"), ncol = 3)
+health_plots <- plot_grid(health_scatter1, health_combo1, healthPC1_total,
+                             health_scatter2, health_combo2, healthPC2_total,
+                             labels = c("1A", "1B", "1C", "2A", "2B", "2C"), 
+                                        ncol = 3, nrow = 2)
+
+# Output
+ggsave(containment_plots, 
+       filename = "../figures/containment_plots_final.png",
+       height = 10, width = 30, units = "cm")
+
+ggsave(economic_plots, 
+       filename = "../figures/economic_plots_final.png",
+       height = 10, width = 30, units = "cm")
+
+ggsave(health_plots, 
+       filename = "../figures/health_plots_final.png",
+       height = 22, width = 30, units = "cm")
+
+```
+
+#### Univariate models
+```{r}
+# Containment
+lm_containment <- lm(data = tracker_combo, formula = delta ~ containment)
+summary(lm_containment)
+
+# Economic
+lm_economic <- lm(data = tracker_combo, formula = delta ~ economic)
+summary(lm_economic)
+
+# Health
+lm_health <- lm(data = tracker_combo, formula = delta ~ healthPC1 + healthPC2)
+summary(lm_health)
+```
+
+### Mobility data - not included in final analyses
+- Source: Google: COVID-19 Community Mobility Reports
+- Description: For a multitude of reasons - fear of contracting COVID-19, adherence to government policies, changing in company policies to allow remote working etc. - movement between different types of locations changed during the pandemic. One source of mobility data is Google phone data that tracks movement between 6 types of location - residential, work etc. - and quantifies movement relative to a baseline. Relevant here as an indicator of changes in behaviour (that may or may not be correlated with government policies or absolute COVID-19 risk etc)
+- Data cleaning done:
+  + Annual data extracted and arithmetic mean of changes in mobility per year per location calculated per country
+  + PCA conducted on 'outside' locations since high correlation between changes in movement between each location
+  + No PCA conducted on 'residential' location since single variable
+  + Calculate and add variables to tracker
+  + Plot relationship between variable and coverage deltas (i) per year, (ii) all years combined, and (iii) cumulative
+- Only during pandemic data available therefore no need to explore pre- vs. during- pandemic datasets
+  
+#### Data cleaning
+```{r}
+# Import data
+file_path_google <- here::here("data", "Global_Mobility_Report.csv")
+
+google_data <- file_path_google %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+google_data
+
+# Clean data
+google <- google_data %>%
+  mutate(year = year(date)) %>%
+  filter(sub_region_1 == "") %>%
+  select(-c(sub_region_1, sub_region_2, metro_area, 
+            iso_3166_2_code, census_fips_code, place_id)) %>%
+  mutate(iso_code = countrycode(sourcevar = country_region_code, 
+                                origin = "iso2c", 
+                                destination = "iso3c")) %>%
+  select(-country_region_code) %>%
+  select(iso_code, country = country_region, year, date, 
+         retail_and_recreation_percent_change_from_baseline:residential_percent_change_from_baseline)
+  
+google_data_annual <- google %>%
+  group_by(iso_code, year) %>%
+  summarise(retail = mean(retail_and_recreation_percent_change_from_baseline, na.rm = TRUE),
+            grocery = mean(grocery_and_pharmacy_percent_change_from_baseline, na.rm = TRUE),
+            transit = mean(transit_stations_percent_change_from_baseline, na.rm = TRUE),
+            parks = mean(parks_percent_change_from_baseline, na.rm = TRUE),
+            workplace = mean(workplaces_percent_change_from_baseline, na.rm = TRUE),
+            residential = mean(residential_percent_change_from_baseline, na.rm= TRUE)) %>%
+  filter(year < 2023) %>%
+  mutate(year = as.character(year)) %>%
+  na.omit()
+
+# Investigate correlation between different mobility indicators
+  mobility_corr <- cor(google_data_annual[,3:8])
+  corrplot(mobility_corr)
+    # High correlation for all movement to 'outside' locations therefore use PCA to simplify      
+
+# Conduct PCA to reduce outside variables to one Principal Component  
+  mobility_pca <- google_data_annual[,3:7] %>%
+    prcomp(center = TRUE, scale = TRUE)
+      
+  summary(mobility_pca) #PC1 explains 81% of the variance
+      
+  ## Describe most important indicators 
+    mobility_pca_loadings <- data.frame(mobility_pca$rotation) %>%
+      arrange(PC1, desc = TRUE)
+    mobility_pca_loadings
+            
+    fviz_pca_var(mobility_pca, col.var = "black")
+    fviz_eig(mobility_pca, addlabels = TRUE)
+
+    mobility_pc1_bar <- fviz_contrib(mobility_pca, choice = "var", axes = 1) #Change axes = x for each PC
+    mobility_pc1_bar
+            
+  ## Transform dataset to create outside indicator
+    ### Labels for extracting transformed variables
+      labels <- google_data_annual %>%
+        select(iso_code, year)
+            
+      extract_mobility_values <- mobility_pca$x[,1] %>% as_tibble()
+
+      mobility_transformed <- labels %>%
+        cbind(extract_mobility_values) %>%
+        rename(mobility_PC1 = value) %>%
+        mutate(mobility_PC1 = mobility_PC1*-1) %>%
+        pivot_wider(names_from = year, names_prefix = "outside_", values_from = mobility_PC1)
+
+# Combine outside and inside indicators to create a summary dataset
+  inside_dat <- google_data_annual %>%
+    select(iso_code, year, residential) %>%
+    pivot_wider(names_from = year, names_prefix = "inside_", values_from = residential)
+  
+  mobility_data <- mobility_transformed %>%
+    left_join(inside_dat, by = "iso_code") %>%
+    mutate(inside_total = inside_2020 + inside_2021 + inside_2022)
+  
+# Add to tracker
+tracker %<>%
+  left_join(mobility_data, by = "iso_code") %>%
+  mutate(outside_2020 = -1*outside_2020,
+         outside_2021 = -1*outside_2021,
+         outside_2022 = -1*outside_2022)
+
+# Create long dataset
+outside_combo_dat <- tracker %>%
+  select(iso_code, x1 = delta_2020, x2 = delta_2021, x3 = delta_2022,
+         y1 = outside_2020, y2 = outside_2021, y3 = outside_2022) %>%
+  pivot_longer(!iso_code,
+               cols_vary = "slowest",
+               names_to = c(".value", "year"),
+                   names_pattern = "(.)(.)") %>%
+      rename(delta = x, outside = y) %>%
+      mutate(year = as.factor(case_when(year == "1" ~ 2020,
+                              year == "2" ~ 2021,
+                              year == "3" ~ 2022)))
+
+inside_combo_dat <- tracker %>%
+  select(iso_code, x1 = delta_2020, x2 = delta_2021, x3 = delta_2022,
+         y1 = inside_2020, y2 = inside_2021, y3 = inside_2022) %>%
+  pivot_longer(!iso_code,
+               cols_vary = "slowest",
+               names_to = c(".value", "year"),
+                   names_pattern = "(.)(.)") %>%
+      rename(delta = x, inside = y) %>%
+      mutate(year = as.factor(case_when(year == "1" ~ 2020,
+                              year == "2" ~ 2021,
+                              year == "3" ~ 2022)))
+    
+tracker_combo %<>%
+  left_join(outside_combo_dat, by = c("iso_code", "year", "delta")) %>%
+  left_join(inside_combo_dat, by = c("iso_code", "year", "delta")) 
+
+# Add data to PCA total
+pca_outside <- tracker %>%
+  select(iso_code, outside_2020, outside_2021, outside_2022) %>%
+  mutate(mean_outside = apply(select(., outside_2020, 
+                                             outside_2021, 
+                                             outside_2022), 1, mean, na.rm = TRUE)) %>%
+  select(iso_code, mean_outside)
+
+pca_vars %<>%
+  left_join(pca_outside, by = "iso_code")
+
+```
+
+#### Final figures
+```{r}
+# Per year
+  # Outside
+    outside_per_year <- ggplot(data = tracker)+
+      geom_point(aes(x = outside_2020, y = delta_2020, colour = "2020"))+
+      geom_smooth(aes(x = outside_2020, y = delta_2020, colour = "2020")) +
+      geom_point(aes(x = outside_2021, y = delta_2021, colour = "2021"))+
+      geom_smooth(aes(x = outside_2021, y = delta_2021, colour = "2021")) +
+      geom_point(aes(x = outside_2022, y = delta_2022, colour = "2022"))+
+      geom_smooth(aes(x = outside_2022, y = delta_2022, colour = "2022")) +
+      labs(x = "Outside mobility (Principal Component))", y = "DTP3 coverage delta")+
+      colour+
+      scale_y_lim+
+      theme(legend.position = c(0.8,0.2),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+
+      hline
+
+  # Inside
+    inside_per_year <- ggplot(data = tracker)+
+      geom_point(aes(x = inside_2020, y = delta_2020, colour = "2020"))+
+      geom_smooth(aes(x = inside_2020, y = delta_2020, colour = "2020")) +
+      geom_point(aes(x = inside_2021, y = delta_2021, colour = "2021"))+
+      geom_smooth(aes(x = inside_2021, y = delta_2021, colour = "2021")) +
+      geom_point(aes(x = inside_2022, y = delta_2022, colour = "2022"))+
+      geom_smooth(aes(x = inside_2022, y = delta_2022, colour = "2022")) +
+      labs(x = "% change in inside movement vs.\n 2019 baseline)", y = "DTP3 coverage delta")+
+      colour+
+      scale_y_lim+
+      theme(legend.position = c(0.1, 0.2), 
+        legend.direction = "vertical",
+        legend.box = "horizontal",
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+
+      hline
+    
+# Combined
+  # Outside
+    outside_combo <- ggplot(data = tracker_combo)+
+      geom_point(aes(x = outside, y = delta, colour = year))+
+      labs(x = "Outside mobility (Principal Component)", y = "DTP3 coverage delta")+
+      geom_smooth(aes(x = outside, y = delta), colour = "darkgrey")+
+    colour+
+    scale_y_lim+
+    theme(legend.position = c(0.8, 0.2),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+
+    hline
+ 
+  # Inside
+    inside_combo <- ggplot(data = tracker_combo)+
+      geom_point(aes(x = inside, y = delta, colour = year))+
+      labs(x = "% change in residential movement vs.\n 2019 baseline", y = "DTP3 coverage delta")+
+      geom_smooth(aes(x = inside, y = delta), colour = "darkgrey")+
+    colour+
+    scale_y_lim+
+    theme(legend.position = c(0.1,0.2), 
+        legend.direction = "vertical",
+        legend.box = "horizontal",
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8))+
+    hline
+
+# Total
+  outside_total <- ggplot(data = pca_vars %>% filter(iso_code != "VNM"))+
+    geom_point(aes(x = mean_outside, y = delta_total))+
+    geom_smooth(aes(x = mean_outside, y = delta_total), colour = "darkgrey")+
+    labs(x = "Outside mobility Principal\nComponent (mean 2020-2022)",
+         y = "DTP3 coverage delta\n(cumulative 2020-2022)")+
+    scale_y+
+    theme+
+    hline
+  
+  inside_total <- ggplot(data = tracker %>% filter(iso_code != "VNM"))+
+    geom_point(aes(x = inside_total, y = delta_total))+
+    geom_smooth(aes(x = inside_total, y = delta_total), colour = "darkgrey")+
+    labs(x = "Cumulative % change in residential movement\n(2020-2022) vs. 2019 baseline",
+         y = "DTP3 coverage delta\n(cumulative 2020-2022)")+
+    scale_y+
+    theme+
+    hline
+  
+# Output 
+outside_plots <- plot_grid(outside_per_year, outside_combo, outside_total,
+                           labels = c("A", "B", "C"),
+                           ncol = 3,
+                           label_size = 10)
+
+residential_plots <- plot_grid(inside_per_year, inside_combo, inside_total,
+                               labels = c("A", "B", "C"),
+                               ncol = 3,
+                               label_size = 10)
+
+# Save plots
+  ggsave(outside_plots, 
+         filename = "../figures/outside.png",
+         height = 10, width = 30, units = "cm")
+  
+  ggsave(residential_plots, 
+         filename = "../figures/residential.png",
+         height = 10, width = 30, units = "cm")
+```
+
+#### Univariate model
+```{r}
+# Outside
+lm_outside <- lm(data = tracker_combo, formula = delta ~ outside)
+summary(lm_outside)
+
+# Inside
+lm_inside <- lm(data = tracker_combo, formula = delta ~ inside)
+summary(lm_inside)
+
+```
+
+### Vaccine hesitancy - not included in final analyses
+Vaccine hesitancy may be a driver of reduced immunisation coverage - before, during, or after the pandemic. We were not able to include vaccine hesitancy within our analyses due to insufficient data coded in a systematic way at national level. We include some brief analyses below that led to these conclusions.
+
+- Source: Vaccine Confidence Project
+- Here we investigate and describe the limited data on vaccine hesitancy, which is ultimately not included in predictor analyses and referenced in the discussion section of the paper only
+```{r}
+file_path_confidence <- here::here("data", "vcp-global-data.rds")
+  
+  confidence_data <- file_path_confidence %>%
+    rio::import(header = TRUE) %>%
+    tibble()
+  confidence_data
+  
+  confidence <- confidence_data %>%
+    select(country = Country, VaxImpAll, VaxImpChild, VaxSaf, VaxEff, VaxRel, year = Year) %>%
+    mutate(VaxImpAll = as.numeric(VaxImpAll),
+           VaxImpChild = as.numeric(VaxImpChild),
+           VaxSaf = as.numeric(VaxSaf),
+           VaxEff = as.numeric(VaxEff),
+           VaxRel  =as.numeric(VaxRel)) 
+  
+  # Some countries are misnamed, e.g., '1 Morocco' therefore address this
+  confidence$country <- gsub("^\\d+\\s*", "", confidence$country)
+
+  # Group by country and year to give total hesitancy scores per year
+  # VaxImpAll has much fewer responses than other variables therefore ignore
+  confidence %<>% 
+    group_by(country, year) %>%
+    summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE))) %>%
+    rowwise() %>%
+    mutate(VaxTot = mean(VaxImpChild, VaxSaf, VaxEff, VaxRel, na.rm = TRUE),
+           iso_code = countrycode(sourcevar = country, origin = "country.name", destination = "iso3c")) %>%
+    select(iso_code, year, VaxTot, VaxImpChild, VaxSaf, VaxEff, VaxRel)
+  
+  # Split into pre- and during-pandemic datasets - take the latest pre-pandemic data (e.g., if 2015 and 2019 data for one country, take 2019)
+  confidence_pre <- confidence %>%
+    filter(year <= 2019) %>%
+    group_by(iso_code) %>%
+    filter(year == max(year)) %>%
+    ungroup()%>%
+    rename(Pre_VaxTot = VaxTot,
+           Pre_VaxImpChild = VaxImpChild,
+           Pre_VaxSaf = VaxSaf,
+           Pre_VaxEff = VaxEff,
+           Pre_VaxRel = VaxRel)
+  
+  confidence_during <- confidence %>%
+    filter(year >= 2020) %>%
+    group_by(iso_code) %>%
+    filter(year == max(year)) %>%
+    ungroup()%>%
+    select(-year) %>%
+    rename(Post_VaxTot = VaxTot,
+           Post_VaxImpChild = VaxImpChild,
+           Post_VaxSaf = VaxSaf,
+           Post_VaxEff = VaxEff,
+           Post_VaxRel = VaxRel)
+  
+  confidence_change <- confidence_pre %>%
+    left_join(confidence_during, by = c("country", "iso_code"))
+  
+  confidence_change_complete <- confidence_change %>%
+    na.omit()
+  
+  # Data for only 56 countries, therefore no further analysis done to further clean and explore inclusion, since reduces dataset size too much.
+```
+
+## Look at correlations between variables in the tracker
+```{r}
+indicators_correlation <- cor(tracker[-1], use = "pairwise.complete.obs")
+
+corrplot(indicators_correlation, tl.cex = 0.7, tl.pos = "n")
+```
+
+## Describe completeness of data
+The completeness table describes the completeness of independent variable data in comparison to the denominator set of countries for which we have dependent variables (182 countries). In the publication we report predictor completeness as a percentage of the full set of 195 countries/states recognised in most United Nations datasets (e.g., population, coverage).
+
+The mobility data is only available for 65% of countries, therefore we remove this predictor from the analyses reported in the main body of the paper. We do explore the potential explanatory value of this variable and provide some details in the Supplementary Materials.
+```{r}
+# Summarise completeness of each variable
+completeness_table <- sapply(tracker, function(column) sum(!is.na(column)))
+
+completeness <- data.frame(Column = names(completeness_table), NonNA_Count = completeness_table) %>%
+  mutate(percent = round((NonNA_Count/195)*100,0))
+completeness
+
+# Complete data availability
+complete_data <- tracker %>%
+  mutate(placeholder = rowSums(across(where(is.numeric)))) %>%
+  filter(!is.na(placeholder)) %>%
+  select(-placeholder)
+
+# Summarise gaps by country
+country_labels <- tracker %>%
+  select(iso_code)
+
+column <- apply(is.na(tracker[,-(1)]),1,mean) %>% as_tibble()
+
+missing_country <- country_labels %>%
+  cbind(column) %>%
+  mutate(value = round(value*100, digits = 1)) %>%
+  rename(percent_datapoints_missing = value)
+missing_country
+
+# Summarise gaps by variable
+variable_labels <- colnames(tracker) %>% as_tibble() %>% filter(value != "iso_code") %>%
+  rename(iso_code = value)
+
+row <- apply(is.na(tracker[,-1]),2, mean) %>% as_tibble()
+
+missing_variable <- variable_labels %>%
+  cbind(row) %>%
+  mutate(value = round(value*100, digits = 1)) %>%
+  rename(percent_datapoints_missing = value)
+missing_variable
+
+# Exploring missing data by each variable - replace x with variable of interest
+missing_x <- tracker %>% filter(is.na(containment_PC1_2020)) %>%
+  mutate(country = countrycode(sourcevar = iso_code, 
+                               origin = "iso3c", 
+                               destination = "country.name.en"),
+         region = countrycode(sourcevar = iso_code,
+                              origin = "iso3c",
+                              destination = "un.region.name")) %>%
+  select(country, region)
+missing_x
+
+```
+
+
+
+# Linear Regression modelling
+## Finalise datasets for analyses
+- Here we create two datasets: (1) complete dataset for primary analyses reported in the main paper; and (2) sensitivity analysis data that excludes mobility variables in order to retain more countries (particularly low- and middle-income countries) which is reported in the Supplementary Materials
+```{r}
+count_data <- tracker_combo %>%
+  left_join(income, by = "iso_code")
+
+# Dataset including mobility data
+all_predictor_data <- count_data %>%
+  na.omit() %>%
+  as_tibble()
+
+all_predictor_count_reg <- all_predictor_data %>%
+  filter(year == 2020) %>%
+  mutate(region = countrycode(sourcevar = iso_code,
+                              origin = "iso3c",
+                              destination = "un.region.name")) %>%
+  group_by(region) %>%
+  count()
+
+all_predictor_count_inc <- all_predictor_data %>%
+  filter(year == 2020) %>%
+  group_by(income_group) %>%
+  count()
+
+# Dataset excluding mobility data - core data reported in main body of paper to retain more countries
+core_data <- count_data %>%
+  select(-c(outside, inside)) %>%
+  na.omit() %>%
+  as_tibble()
+
+core_count_reg <- core_data %>%
+  filter(year == 2020) %>%
+  mutate(region = countrycode(sourcevar = iso_code,
+                              origin = "iso3c",
+                              destination = "un.region.name")) %>%
+  group_by(region) %>%
+  count()
+
+core_count_inc <- core_data %>%
+  filter(year == 2020) %>%
+  group_by(income_group) %>%
+  count()
+
+target_count_reg <- ri %>%
+  mutate(region = countrycode(sourcevar = iso_code,
+                              origin = "iso3c",
+                              destination = "un.region.name")) %>%
+  group_by(region) %>%
+  count()
+
+target_count_inc <- ri %>%
+  left_join(income, by = "iso_code") %>%
+  group_by(income_group) %>%
+  count() %>%
+  as_tibble() %>%
+  mutate(income_group = as.character(income_group)) %>%
+  filter(nchar(income_group) >2)
+
+country_compare_count_reg <- target_count_reg %>%
+  rename(target = n) %>%
+  left_join(all_predictor_count, by = "region") %>%
+  rename(all_predictor_dataset = n) %>%
+  mutate(all_predictor_perc = round(all_predictor_dataset/target*100,0)) %>%
+  left_join(core_count, by = "region") %>%
+  rename(core_dataset = n) %>%
+  mutate(core_perc = round(core_dataset/target*100,0))
+country_compare_count_reg
+
+country_compare_count_inc <- target_count_inc %>%
+  rename(target = n) %>%
+  left_join(all_predictor_count_inc, by = "income_group") %>%
+  rename(all_predictor_dataset = n) %>%
+  mutate(all_predictor_perc = round(all_predictor_dataset/target*100,0)) %>%
+  left_join(core_count_inc, by = "income_group") %>%
+  rename(core_dataset = n) %>%
+  mutate(core_perc = round(core_dataset/target*100,0))
+country_compare_count_inc
+```
+
+## Select dataset for analyses
+- Choose either 'core_data' or 'all_predictor_data' for running the linear regression and Random Forest code chunks below
+- Need to also toggle if the label should save outputs as sensitivity analyses or not
+```{r}
+test_data <- all_predictor_data   # Enter all_predictor_data or core_data
+
+label <- case_when(nrow(test_data) == nrow(all_predictor_data) ~ "_incl_mobility", .default = "_core")
+```
+
+## Stepwise linear regression modelling
+We add variables to our linear model in the order of the conceptual framework extended from a literature review and adpated to the pandemic context.
+- At each step we add a variable, visualise the residuals to see if the relationship is linear, where non-linear we create a threshold binary variable to indicate a turning point and add the interaction term to the linear model. We then review the strength of association (p value) and BIC (explanatory power compared to complexity) and include other those predictors that have a p value of < 0.001 and lower the BIC
+
+### 1) Immunisation system strength
+```{r}
+# Univariate model  
+  model1 <- lm(data = test_data, formula = delta ~ average_cov)
+    summary(model1)
+
+# Visualise relationship
+  ri_plots #Visually suggests turning point with change in relationship - therefore test turning point
+
+# Identify threshold
+  ri_test <- test_data %>%
+    select(iso_code, average_cov, delta)
+
+  ri_threshold <- find_threshold(ri_test$average_cov, ri_test$delta)
+  ri_threshold
+
+  custom_plot(ri_test$average_cov, ri_test$delta, ri_threshold$model)
+
+# Add in RI threshold indicator
+  test_data %<>%
+    mutate(ri_threshold = case_when(average_cov < ri_threshold$threshold ~ 0,      # Add a binary flag to signal calculated turning point
+                                   .default = 1))
+
+# Linear model
+  model1a <- lm(data = test_data, formula = delta ~ average_cov * ri_threshold)
+  summary(model1a)
+    # Include only the RI threshold and interaction term; remove average_cov
+  
+  model1b <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov)
+  summary(model1b)
+
+# Compare models
+  BIC(model1, model1a, model1b) #Keep model1b
+  
+# Set-up data for plotting next variable
+  model1res <- model1b$residuals %>% as_tibble()
+```
+
+### 2) Health workforce capacity
+```{r}
+# Linear model
+  model2 <- lm(data = test_data,
+                    formula = delta ~ ri_threshold + ri_threshold:average_cov + healthworkforce)
+  summary(model2)
+  
+# Visualise relationship
+  model2_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = healthworkforce, y = model1res$value))+
+    geom_smooth(aes(x = healthworkforce, y = model1res$value), colour = "darkgrey")
+  model2_plot
+    # Looks like different relationship before and after healthworkforce =~ 60 therfore test threshold
+
+# Identify threshold
+  hcw_test <- test_data %>%
+    select(iso_code, healthworkforce) %>%
+    cbind(model1res) %>%
+    rename(res = value)
+
+  hcw_threshold <- find_threshold(hcw_test$healthworkforce, hcw_test$res)
+  hcw_threshold
+
+  custom_plot(hcw_test$healthworkforce, hcw_test$res, hcw_threshold$model)
+  
+  test_data %<>%
+    mutate(healthworkforce_threshold = case_when(healthworkforce < hcw_threshold$threshold ~ 0,
+                                                 .default = 1))
+  
+  model2b <- lm(data = test_data,
+                     formula = delta ~ ri_threshold + ri_threshold:average_cov + 
+                       healthworkforce * healthworkforce_threshold)
+  summary(model2b)
+    # What about not including healthworkforce_threshold?
+  
+  model2c <- lm(data = test_data,
+                     formula = delta ~ ri_threshold + ri_threshold:average_cov+
+                       healthworkforce + healthworkforce_threshold:healthworkforce)
+  summary(model2c)
+  
+# Compare AIC of models
+  BIC(model1b, model2, model2b, model2c)
+    # Keep model 2c - i.e., include the interaction term
+  
+  # Set-up data for plotting next variable
+  model2res <- model2c$residuals %>% as_tibble()
+```
+
+### 3) Health systems strength
+```{r}
+# Linear model
+  model3 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov+
+                       healthworkforce + healthworkforce_threshold:healthworkforce + 
+                      uhc_mean_index)
+  summary(model3)
+  
+# Visualise relationship
+  model3plot <- ggplot(data = test_data)+
+    geom_point(aes(x = uhc_mean_index, y = model2res$value)) + 
+    geom_smooth(aes(x = uhc_mean_index, y = model2res$value), colour = "darkgrey")+
+    theme
+  model3plot  
+    # No threshold turning point to be explored
+  
+# Compare AIC of models
+  BIC(model2c, model3)
+    # Do not include health systems strength
+```
+
+### 4) Global health security
+```{r}
+# Linear model
+  model4 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov+
+                       healthworkforce + healthworkforce_threshold:healthworkforce + ghs_index)
+  summary(model4)
+  
+  BIC(model4, model2c)
+    
+# Visualise relationship
+  model4plot <- ggplot(data = test_data)+
+    geom_point(aes(x = ghs_index, y = model2res$value)) + 
+    geom_smooth(aes(x = ghs_index, y = model2res$value), colour = "darkgrey")+
+    theme
+  model4plot  
+    # No threshold turning point to be explored
+    # Do not include global health security
+```
+
+### 5) Covid-19 vaccination
+```{r}
+# Linear model
+  model5 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov+
+                       healthworkforce + healthworkforce_threshold:healthworkforce + vx)
+  summary(model5)
+  BIC(model5, model2c)
+  
+# Visualise relationship
+  model5_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = vx, y = model2res$value))+
+    geom_smooth(aes(x = vx, y = model2res$value), colour = "darkgrey")
+  model5_plot
+    # No threshold turning point to be explored
+    # Linear and no relationship - Do not include COVID-19 vaccination
+```
+
+### 6) Covid-19 burden (excess mortality)
+```{r}
+# Linear model
+  model6 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov+
+                       healthworkforce + healthworkforce_threshold:healthworkforce + mortality)
+  summary(model6)
+
+# Visualise relationship
+  model6_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = mortality, y = model2res$value))+
+    geom_smooth(aes(x = mortality, y = model2res$value), colour = "darkgrey")
+  model6_plot
+    # No threshold turning point to be explored
+
+# Calculate BIC
+  BIC(model2c, model6)
+    # Do not include mortality
+```
+
+### 7) Health policy during COVID-19
+```{r}
+# Linear model
+  model7 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov + 
+                      healthworkforce + healthworkforce_threshold:healthworkforce + healthPC1 + healthPC2)
+
+  summary(model7)
+  BIC(model7, model2c)
+
+# Visualise relationship
+  model7a_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = healthPC1, y = model2res$value))+ 
+    geom_smooth(aes(x = healthPC1, y = model2res$value), colour = "darkgrey")
+  model7a_plot
+  
+  model7b_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = healthPC2, y = model2res$value))+ 
+    geom_smooth(aes(x = healthPC2, y = model2res$value), colour = "darkgrey")
+  model7b_plot
+   # No threshold turning point to be explored
+   # Do not include health policy
+
+
+```
+
+### Health financing
+#### 8) Government
+```{r}
+# Linear model
+  model8 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov+
+                       healthworkforce + healthworkforce_threshold:healthworkforce + gov)
+  summary(model8)
+  BIC(model8, model2c)
+  
+# Visualise relationship
+  model8_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = gov, y = model2res$value))+
+    geom_smooth(aes(x = gov, y = model2res$value), colour = "darkgrey")
+  model8_plot
+   # No threshold turning point to be explored
+   # Do not include government financing
+```
+
+#### 9) External health financing
+```{r}
+# Linear model
+  model9 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov + 
+                      healthworkforce + healthworkforce_threshold:healthworkforce + ext)
+  summary(model9)
+  BIC(model9, model2c)
+  
+# Visualise relationship
+  model9_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = ext, y = model2res$value))+
+    geom_smooth(aes(x = ext, y = model2res$value), colour = "darkgrey")
+  model9_plot
+   # No threshold turning point to be explored
+   # Do not include external financing
+```
+
+#### 10) Private healthcare financing
+```{r}
+# Linear model
+  model10 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov + 
+                      healthworkforce + healthworkforce_threshold:healthworkforce + private)
+  summary(model10)
+  BIC(model10, model2c)
+  
+# Visualise relationship
+  model10_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = private, y = model2res$value))+
+    geom_smooth(aes(x = private, y = model2res$value), colour = "darkgrey")
+  model10_plot
+   # No threshold turning point to be explored
+   # Do not include private financing
+
+```
+
+### Mobility - not run for core analyses
+#### Additional) Outside
+- Do not run if running core analyses since mobility excluded to retain more countries. Use only when running on 'all_predictor_data' to explore if any mobility relationship.
+```{r}
+# Linear model
+  #model11 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov + 
+  #                    healthworkforce + healthworkforce_threshold:healthworkforce + outside)
+  #summary(model11)
+
+# Visualise relationship
+  #model11_plot <- ggplot(data = test_data)+
+  #  geom_point(aes(x = outside, y = model2res$value))+
+  #  geom_smooth(aes(x = outside, y = model2res$value), colour = "darkgrey")
+  #model11_plot
+
+# Compare AIC
+  #BIC(model2c, model11)
+    # BIC is slightly lower when no mobility terms included therefore do not include
+```
+
+#### Additional) Inside
+- Do not run if running core analyses since mobility excluded to retain more countries. Use only when running on 'all_predictor_data' to explore if any mobility relationship.
+```{r}
+# Add inside mobility
+  #model12 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov + 
+  #                    healthworkforce + healthworkforce_threshold:healthworkforce + inside)
+  #summary(model12)
+  #BIC(model12, model2c)
+  
+# Visualise relationship
+  #model12_plot <- ggplot(data = test_data)+
+  #  geom_point(aes(x = inside, y = model2res$value))+
+  #  geom_smooth(aes(x = inside, y = model2res$value), colour = "darkgrey")
+  #model12_plot
+    # No clear linear or non linear relationship --> do not include
+```
+
+### Add COVID-19 policies
+#### 11) Containment
+```{r}
+# Linear model
+  model11 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov + 
+                      healthworkforce + healthworkforce_threshold:healthworkforce + containment)
+
+  summary(model11)
+  BIC(model11, model2c)
+
+# Visualise relationship
+  model11_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = containment, y = model2res$value))+
+    geom_smooth(aes(x = containment, y = model2res$value), colour = "darkgrey")
+  model11_plot
+   # No threshold turning point to be explored
+   # Do not include containment policies
+```
+#### 12) Economic
+```{r}
+# Linear model
+  model12 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov + 
+                      healthworkforce + healthworkforce_threshold:healthworkforce + economic)
+
+  summary(model12)
+  BIC(model12, model2c)
+
+# Visualise relationship
+  model12_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = economic, y = model2res$value))+ 
+    geom_smooth(aes(x = economic, y = model2res$value), colour = "darkgrey")
+  model12_plot
+   # No threshold turning point to be explored
+   # Do not include containment policies
+```
+
+### 13) GDP
+```{r}
+# Linear model
+  model13 <- lm(data = test_data, formula = delta ~ ri_threshold + ri_threshold:average_cov + 
+                      healthworkforce + healthworkforce_threshold:healthworkforce + average_gdp)
+
+  summary(model13)
+  BIC(model13, model2c)
+
+# Visualise relationship
+  model13_plot <- ggplot(data = test_data)+
+    geom_point(aes(x = average_gdp, y = model2res$value))+ 
+    geom_smooth(aes(x = average_gdp, y = model2res$value), colour = "darkgrey")
+  model13_plot
+   # No threshold turning point to be explored
+   # Do not include containment policies
+```
+### Final complete model and summary improvements
+- Here we explore the final model, including:
+  + Creating summary tables of the findings for the publication
+  + Looking at residuals 
+```{r}
+# Final model
+  model_complete_final <- model2c
+  summary(model_complete_final)
+  ri_threshold_print <- round(ri_threshold$threshold,0)
+  hcw_threshold_print <- round(hcw_threshold$threshold,0)
+  
+# Create summary table to summarise model
+model_summary <- tidy(model_complete_final) %>%
+  mutate(estimate = format(estimate, scientific = FALSE, digits = 1),
+         std.error = format(std.error, scientific = FALSE, digits = 1),
+         statistic = format(statistic, scientific = FALSE, digits = 2),
+         p.value = format(p.value, scientific = FALSE, digits = 1)) %>%
+  mutate(Term = c("Intercept", 
+                  paste("Threshold coverage (binary variable): Pre-pandemic\n DTP3 coverage > ",ri_threshold_print,"%",sep = ""),
+                  "Health workforce capacity", 
+                  "Threshold coverage * pre-pandemic DTP3 coverage",
+                  paste("Threshold health workforce (binary variable; > ",hcw_threshold_print," health workers per 10k population) * health workforce capacity",sep = ""))) %>%
+  select(Term, Estimate = estimate, `Std. Error` = std.error, `t-value` = statistic, `p-value` = p.value)
+
+model_summary_table <- flextable(model_summary) %>%
+  theme_vanilla() %>%
+  autofit()
+model_summary_table
+
+# Save output table formatted for Word
+doc <- read_docx()
+doc <- body_add_flextable(doc, value = model_summary_table)
+print(doc, target = paste("../figures/lm_summary",label,".docx",sep = ""))
+
+# Explore residuals
+  # Extract residuals
+  final_residuals <- model_complete_final$residuals 
+  
+  # Combine dataset
+  residuals_explore <- test_data %>%
+    cbind(final_residuals) 
+  
+  residuals_explore %<>%
+    arrange(residuals_explore$final_residuals, decreasing = TRUE)
+  
+  # Look at residuals distribution
+  residuals_distribution <- plot(fitted(model_complete_final), final_residuals)
+  
+  # See if residuals are normally distributed
+  
+  qqnorm(final_residuals)
+  
+  plot(density(final_residuals))
+
+```
+
+# Random Forest analysis
+
+## Conduct analysis
+Here we simplify our data to the finalised dataset (no threshold variables or variables that have been further summarised), then build a forest with 500 trees. The type is "regression" since all data is numeric.
+```{r}
+random_forest_data <- test_data %>%
+  select(-contains("threshold"))
+  # Remove the threshold variables created during the univariate analyses
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Split data into train and test data
+sample_size <- floor(0.7 * nrow(random_forest_data))
+train_indices <- sample(seq_len(nrow(random_forest_data)), size = sample_size)
+rf_train_data <- random_forest_data[train_indices, ] 
+rf_test_data <- random_forest_data[-train_indices, ] 
+
+# Remove descriptors for building random forest
+rf_train_dat <- rf_train_data %>%
+  select(-c("iso_code", "year"))
+
+rf_test_dat <- rf_test_data %>%
+  select(-c("iso_code", "year"))
+
+# Random Forest
+rf_model <- randomForest(delta ~ ., 
+                         type = "regression",
+                         data = rf_train_dat, 
+                         ntree = 500, 
+                         mtry = 5, 
+                         importance = TRUE, 
+                         rsq = TRUE)
+rf_model
+```
+
+
+### Investigate variable importance from Random Forest
+We explore the findings of the Random Forest by reviewing the importance of each variable in terms of:
+- Mean Decrease in Accuracy (MDA): variable importance based on the mean decrease in accuracy when the predictor is excluded from trees. MDA scores are relative to variables within the model.
+- Mean Decrease in Impurity (MDI): variable importance based on the mean decrease in the Gini index which assesses the purity of nodes and splits within the trees (i.e., how good the variable is when used as a splitting node in the tree). MDI scores are relative to variables within the model.
+- Conditional Feature Contributions (CFC): variable importance in terms of how each variable contributes to the predictions for individual observations, averaged over the forest. This is calculated in terms of the Accumulated Local Effects (ALE) of each variable, which is a type of partial dependence plot that indicates how much the model's prediction changes, on average, when the variable value changes, whilse accounting for the local distribution of the variable values in the dataset. Flat sections of the plots indicate that changes in the variable value have little or no effect on the prediction, whilst steep sections indicate that changes in the variable value have a significant effect. 
+
+We produce a figure to summarise the MDA and MDI scores per variable. 
+```{r}
+# Review MDA and MDI of variables from model
+importance(rf_model)
+varImpPlot(rf_model)
+
+# Output figure
+importance_data <- importance(rf_model) %>%
+  as.data.frame()
+
+importance_data %<>%
+  mutate(Variable = rownames(importance_data)) %>%
+  select(Variable, `Mean Decrease in Accuracy (%)` = `%IncMSE`, `Mean Decrease in Impurity (%)` = `IncNodePurity`) %>%
+  melt(importance_df, id.vars = "Variable", 
+                          measure.vars = c("Mean Decrease in Accuracy (%)", "Mean Decrease in Impurity (%)"),
+                          variable.name = "Metric", 
+                          value.name = "Importance") %>%
+  mutate(Variable = case_match(Variable,
+                               "average_cov" ~ "Pre-pandemic immunisation performance", 
+                               "healthworkforce" ~ "Healthworkforce capacity",
+                               "uhc_mean_index" ~ "Health systems strength",
+                               "ghs_index" ~ "Global Health Security strength",
+                               "vx" ~ "COVID-19 vaccination levels",
+                               "mortality" ~ "Excess mortality during pandemic",
+                               "gov" ~ "Government health financing (PPP)",
+                               "ext" ~ "Donor health financing (PPP)",
+                               "private" ~ "Private health financing, e.g., OOP (PPP)",
+                               "average_gdp" ~ "National Gross Domestic Product (PPP)",
+                               "containment" ~ "Containment policy stringency",
+                               "economic" ~ "Economic policy stringency",
+                               "healthPC1" ~ "Health policy stringency (PC1)",
+                               "healthPC2" ~ "Health policy stringency (PC2)",
+                               "inside" ~ "Inside mobility",
+                               "outside" ~ "Outside mobility")) %>%
+  mutate(Importance = format(Importance, scientific = FALSE, digits = 1),
+         Importance = as.numeric(Importance))
+
+  # Create the plot
+  importance_plot <- ggplot(importance_data, 
+                            aes(x = reorder(Variable, Importance), 
+                                y = Importance, fill = Metric)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = paste(format(round(Importance, digits = 2),nsmall = 2), "%", sep = "")),  # Format values as percentages
+              position = position_dodge(width = 0.9),  
+              hjust = ifelse(importance_data$Importance < 0.015, -1, 1), 
+              #nudge_y = ifelse(importance_data$Importance < 0, -1, 1),
+              size =2.5) + 
+    coord_flip() +  # Flip coordinates for better readability
+    facet_wrap(~ Metric, scales = "free_x") +  # Separate plots for MDA and MDI
+    labs(x = "Variables",
+         y = "Importance Scores") +
+    theme_minimal() +  
+    scale_fill_manual(values = wes_palette("BottleRocket2", n = 2)) +
+    theme(axis.title.x = element_text(size = 10, face = "bold"),
+          axis.title.y = element_text(size = 10, face = "bold"),
+          axis.text = element_text(size = 8),
+          plot.title = element_text(size = 12, face = "bold"),
+          legend.position = "none", 
+          strip.text = element_text(size = 8, face = "bold"),
+          panel.background = element_rect(fill = "white", colour = "white"),
+        plot.background = element_rect(fill = "white", colour = "white"))
+  importance_plot
+
+  # Save plot  
+  ggsave(importance_plot, 
+         filename = paste("../figures/rf_importance",label,".png",sep = ""),
+         height = 10, width = 25, units = "cm")
+```
+
+### Evaluate the performance of the model
+We evaluate the overall predictive power of the model by evaluating the test dataset using the resulting Random Forest model
+```{r}
+# Predictive power
+  # Compare performance of using Random Forest model as predictor on test dataset
+  predictions <- predict(rf_model, newdata = rf_test_dat)
+  
+  # Evaluate the model performance
+  actuals <- rf_test_dat$delta
+  
+# Compare results
+  comparison <- rf_test_data %>%
+    select(iso_code, year, delta) %>%
+    cbind(predictions) %>%
+    mutate(delta = round(delta*100, digits = 3),
+           predictions = round(predictions*100, digits = 3),
+           difference = delta - predictions,
+           sign = if_else(predictions & delta < 0, TRUE, 
+                        if_else(predictions & delta > 0, TRUE, FALSE)))
+  
+  comparison_sign_correct <- sum(comparison$sign, na.rm = TRUE)
+  perc_sign_correct = comparison_sign_correct/107
+  perc_sign_correct
+  
+  # R squared
+  r_squared <- R2(predictions, actuals)
+  r_squared
+
+```
+
+### Explore surrogate tree model
+- Here we create a Tree Surrogate Model, which fits a surrogate decision tree using the predicted values. This does not perfectly match the Random Forest analysis, but allows for easy visualisation of the "thresholds" that split the data at each node, which can be useful for helping to interpret how the predictors contribute.
+- This analysis is not included in the main paper due to word limits. It is included here for interest only.
+```{r}
+# Tree surrogate models
+  # Create a dataset with predictions from the Random Forest model
+  predicted_values <- predict(rf_model, random_forest_data)
+  
+  # Add the predicted values to the dataset
+  random_forest_data$PredictedValue <- predicted_values
+  
+  predictors_data <- random_forest_data[, setdiff(names(random_forest_data), "delta")]
+  
+  # Fit a surrogate decision tree model using the predicted values
+  surrogate_model <- rpart(PredictedValue ~ ., data = predictors_data,
+                           control = rpart.control(cp = 0.001, maxdepth = 5, minsplit = 3))
+  
+  # Save the surrogate tree plot to a PNG file
+  png(filename = "../figures/surrogate_tree.png", 
+      width = 1500, height = 1000)  # Dimensions in pixels
+  
+  # Plot the surrogate decision tree model
+  rpart.plot(surrogate_model,
+            type = 3,                     # Display the split labels
+            extra = 101,                 # Display the number of observations
+            under = TRUE,                # Display labels below nodes
+            faclen = 0,                  # Do not abbreviate factor levels
+            cex = 1,                   # Adjust the size of text labels
+            cex.main = 1.5,                # Adjust the size of the main title
+            cex.sub = 1,               # Adjust the size of the subtitle
+            box.palette = "GnBu",        # Optional: color palette for the boxes
+            fallen.leaves = FALSE,        # Spread out leaves to avoid overlap
+            tweak = 0.8)                 # Adjust spacing between nodes
+  
+  # Close the device to finalize and save the file
+  dev.off()  
+
+```
+
+### Explore co-linearity
+- Here we quantify the extent of colinearity between predictors, which is referenced in the Discussion section as may be relevant to why variables are not included in the final linear model but have relatively high importance in the Random Forest analysis
+``` {r}
+# Look at correlation matrix
+cor_matrix <- cor(random_forest_data %>% select(-c(iso_code, year)))
+cor_matrix
+
+lm_coli <- lm(delta ~ ., data = (random_forest_data %>% select(-c(iso_code, year))))
+alias(lm_coli) # no variables are aliased
+
+# Calculate VIF values
+vif_values <- (vif(lm_coli))
+vif_values
+```
+
+# Map outputs
+Here we product map figures for each predictor to show the variation of the data across countries. These are included in the Supplementary Materials. 
+```{r}
+# Plot coverage deltas visually
+  # Download country map data
+    countries <- ne_countries(returnclass = "sf")
+
+  # Format data for plotting  
+    map_tracker <- tracker %>%
+      left_join(pca_vars,by = "iso_code") %>%
+      select(iso_a3 = iso_code, delta_total = delta_total.x, average_cov, healthworkforce, uhc_mean_index,
+             ghs_index, covid_vx_total, excess_mortality_total, 
+             mean_containment, mean_healthPC1, mean_healthPC2, 
+             mean_economic, gov, ext, private, mean_outside, inside_total, 
+             average_gdp) %>%
+      mutate(delta_total = 100 * delta_total)
+    
+    map_data <- countries %>%
+      left_join(map_tracker, by = c("iso_a3"))
+
+  # Define colour palette
+    pal <- wes_palette("Zissou1", 100, type = "continuous")
+
+  # Plot deltas
+    delta_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = delta_total), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE)) + 
+      labs(fill = "Total DTP3 delta \n(%, 2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 7),
+            legend.title = element_text(size = 7))
+  
+  # Plot average coverage
+    ri_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = average_cov), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE)) + 
+      labs(fill = "Pre-pandemic immunisation programme strength\n(2015-2019 DTP3 coverage") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(ri_map, 
+       filename = "../figures/ri_map.png",
+       height = 15, width = 30, units = "cm")
+    
+  # Plot healthworkforce
+    hwf_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = healthworkforce), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE)) + 
+      labs(fill = "Total # of healthworkers/\n10,000 people") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(hwf_map, 
+       filename = "../figures/hwf_map.png",
+       height = 15, width = 30, units = "cm")
+   
+    # Plot health system strength
+    hss_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = uhc_mean_index), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE)) + 
+      labs(fill = "Universal Health Coverage index score \n(0-100; mean 2015-2019)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(hss_map, 
+       filename = "../figures/hss_map.png",
+       height = 15, width = 30, units = "cm")  
+    
+  # Plot global health security
+    ghs_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = ghs_index), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE)) + 
+      labs(fill = "Global Health Security index score \n(0-100)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(ghs_map, 
+       filename = "../figures/ghs_map.png",
+       height = 15, width = 30, units = "cm") 
+    
+  # Plot COVID-19 vaccination
+    cov_vx_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = covid_vx_total), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Total COVID-19 vaccinations administered \nper 100,000 people (2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(cov_vx_map, 
+       filename = "../figures/cov_vx_map.png",
+       height = 15, width = 30, units = "cm")
+    
+   # Plot COVID-19 burden
+    cov_burden <- ggplot(data = map_data) +
+      geom_sf(aes(fill = excess_mortality_total), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = pal,
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Excess mortality \nper 100,000 people (2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(cov_burden, 
+       filename = "../figures/cov_burden_map.png",
+       height = 15, width = 30, units = "cm")
+  
+   # Plot Containment score
+    containment_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = mean_containment), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = pal,
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Containment policy stringency\nPrincipal Component score (mean 2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(containment_map, 
+       filename = "../figures/containment_map.png",
+       height = 15, width = 30, units = "cm")
+    
+  # Plot Economic score
+    economic <- ggplot(data = map_data) +
+      geom_sf(aes(fill = mean_economic), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Economic policy stringency\nPrincipal Component score (mean 2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(economic, 
+       filename = "../figures/economic_map.png",
+       height = 15, width = 30, units = "cm")
+    
+  # Plot Health policy score
+    health_map1 <- ggplot(data = map_data) +
+      geom_sf(aes(fill = mean_healthPC1), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Health policy stringency\nPrincipal Component 1\n score (mean 2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = "bottom",
+            legend.text = element_text(size = 9),
+            legend.title = element_text(size = 9))
+    
+    health_map2 <- ggplot(data = map_data) +
+      geom_sf(aes(fill = mean_healthPC2), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Health policy stringency\nPrincipal Component 2\n score (mean 2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = "bottom",
+            legend.text = element_text(size = 9),
+            legend.title = element_text(size = 9))
+    
+    health_map <- plot_grid(health_map1, health_map2, labels = c("A", "B", label_size = 10))
+    
+    ggsave(health_map, 
+       filename = "../figures/health_map.png",
+       height = 10, width = 30, units = "cm")
+  
+  # Government health financing
+  gov_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = gov), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Government health financing\n(mean 2015-2019 $PPP)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(gov_map, 
+       filename = "../figures/gov_map.png",
+       height = 15, width = 30, units = "cm")
+    
+# Private health financing
+  private_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = private), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Private health financing\n(mean 2015-2019 $PPP)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(private_map, 
+       filename = "../figures/private_map.png",
+       height = 15, width = 30, units = "cm")
+    
+  # External health financing
+  external_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = ext), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "External health financing\n(mean 2015-2019 $PPP)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(external_map, 
+       filename = "../figures/external_map.png",
+       height = 15, width = 30, units = "cm")
+
+  # Plot outside mobility 
+    outside_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = mean_outside), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Outside movement change\nPrincipal Component score (mean 2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(outside_map, 
+       filename = "../figures/outside_map.png",
+       height = 15, width = 30, units = "cm")
+    
+  # Plot inside mobility 
+    inside_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = inside_total), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Residential movement change\nPercent change from baseline (total 2020-2022)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(inside_map, 
+       filename = "../figures/inside_map.png",
+       height = 15, width = 30, units = "cm")
+    
+  # Plot gdp 
+    gdp_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = average_gdp), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE), 
+                           labels = comma) + 
+      labs(fill = "Gross Domestic Product\n(mean 2015-2019 $PPP)") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 11),
+            legend.title = element_text(size = 11))
+    
+    ggsave(gdp_map, 
+       filename = "../figures/gdp_map.png",
+       height = 15, width = 30, units = "cm") 
+    
+   # Plot residuals
+    resid_data <- residuals_explore %>%
+      select(iso_a3 = iso_code, residuals = final_residuals)
+    
+    map_data %<>%
+      left_join(resid_data, by = "iso_a3")
+    
+    resid_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = residuals), color = "black", size = 0.2) + 
+      scale_fill_gradientn(colours = rev(pal),
+                           na.value = "grey80",
+                           guide = guide_colorbar(reverse = FALSE)) + 
+      labs(fill = "Linear regression model residuals") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 7),
+            legend.title = element_text(size = 7))
+    resid_map
+  
+```
