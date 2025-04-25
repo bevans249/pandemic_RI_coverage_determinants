@@ -2417,10 +2417,10 @@ target_count_inc <- ri %>%
 
 country_compare_count_reg <- target_count_reg %>%
   rename(target = n) %>%
-  left_join(all_predictor_count, by = "region") %>%
+  left_join(all_predictor_count_reg, by = "region") %>%
   rename(all_predictor_dataset = n) %>%
   mutate(all_predictor_perc = round(all_predictor_dataset/target*100,0)) %>%
-  left_join(core_count, by = "region") %>%
+  left_join(core_count_reg, by = "region") %>%
   rename(core_dataset = n) %>%
   mutate(core_perc = round(core_dataset/target*100,0))
 country_compare_count_reg
