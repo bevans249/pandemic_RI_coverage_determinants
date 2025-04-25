@@ -225,7 +225,7 @@ income_grp <- income_grp[-c(1:5), ]
 income_grp
 
 # Clean data - take mid pandemic classification (2021)
-income %<>% 
+income <- income_grp %>% 
   select(V1, `2021`) %>%
   rename(iso_code = V1, `income_group` = `2021`) %>%
   mutate(
